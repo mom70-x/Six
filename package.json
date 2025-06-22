@@ -1,59 +1,31 @@
 {
-  "name": "distributed-nostr-node",
+  "name": "bot4-feed-server",
   "version": "1.0.0",
-  "description": "Distributed Nostr relay node for 6-node resilient network",
+  "description": "Bot #4 - Feed Server для пагинации постов из Telegram группы",
   "main": "server.js",
   "scripts": {
-    "start": "server.js",
-    "dev": "NODE_ENV=development node server.js",
-    "test": "echo \"Testing network health...\" && node test-health.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "ws": "^8.14.2",
+    "node-telegram-bot-api": "^0.66.0",
     "cors": "^2.8.5"
   },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
   "keywords": [
-    "nostr",
-    "distributed",
-    "relay",
-    "network",
-    "resilient",
-    "tetrahedral"
+    "telegram",
+    "bot",
+    "feed",
+    "api",
+    "pagination"
   ],
-  "author": "Distributed Network Team",
+  "author": "Bot #4 Team",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/yourusername/distributed-nostr-network.git"
-  },
-  "environment": {
-    "production": {
-      "NODE_ENV": "production",
-      "NODE_ID": "SET_PER_NODE",
-      "NODE_ROLE": "SET_PER_NODE",
-      "PEER_1": "https://render-node-1.onrender.com",
-      "PEER_2": "https://render-node-2.onrender.com", 
-      "PEER_3": "https://render-node-3.onrender.com",
-      "PEER_4": "https://railway-node-1.up.railway.app",
-      "PEER_5": "https://railway-node-2.up.railway.app",
-      "PEER_6": "https://railway-node-3.up.railway.app",
-      "PING_URL": "SET_PER_NODE"
-    }
-  },
-  "deployment": {
-    "render": {
-      "buildCommand": "npm install",
-      "startCommand": "npm start",
-      "healthCheckPath": "/heartbeat"
-    },
-    "railway": {
-      "buildCommand": "npm install", 
-      "startCommand": "npm start",
-      "healthCheckPath": "/heartbeat"
-    }
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
