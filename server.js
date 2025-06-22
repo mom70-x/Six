@@ -1,729 +1,370 @@
-// 🌊 Distributed Nostr Network - Optimized 4-Node Architecture
-// Гармоничная архитектура: 1 master + 2 storage + 1 gateway
-
 const express = require('express');
-const { WebSocketServer } = require('ws');
-const crypto = require('crypto');
-const WebSocket = require('ws');
+const TelegramBot = require('node-telegram-bot-api');
+const cors = require('cors');
 
-// ========================= GOLDEN RATIO CONSTANTS =========================
+// ========================= КОНФИГУРАЦИЯ =========================
 
-const GOLDEN_RATIO = 1.618;
-const FIBONACCI = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
+const BOT_TOKEN = '7229365201:AAHVSXlcoU06UVsTn3Vwp9deRndatnlJLVA';
+const GROUP_ID = '-1002268255207'; // Группа БД
+const PORT = process.env.PORT || 8080;
 
-const NETWORK_CONFIG = {
-  topology: 'tetrahedral',
-  nodeId: process.env.NODE_ID || `node-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 5)}`,
+// ========================= ИНИЦИАЛИЗАЦИЯ =========================
 
-  // 🎯 Упрощенная 4-узловая архитектура
-  roles: {
-    master: 1,    // Координация и консенсус
-    storage: 2,   // Хранение данных с репликацией
-    gateway: 1    // Точка входа для клиентов
-  },
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
+const app = express();
 
-  // 🔗 4 основных узла
-  peers: [
-    process.env.PEER_1, // master-001
-    process.env.PEER_2, // storage-001  
-    process.env.PEER_3, // storage-002
-    process.env.PEER_4  // gateway-001
-  ].filter(Boolean),
+app.use(cors());
+app.use(express.json());
 
-  // ⏰ Увеличенные timeout'ы для Render
-  keepAlive: {
-    interval: 30 * 1000,        // 30 секунд (было 12 минут)
-    pingUrl: process.env.PING_URL,
-    healthCheck: '/heartbeat',
-    peerTimeout: 120 * 1000,    // 2 минуты ожидания peer'а
-    reconnectDelay: 5 * 1000    // 5 секунд между переподключениями
-  },
+// ========================= УТИЛИТЫ =========================
 
-  consensus: {
-    quorum: 3,               // Минимум 3 узла (было 4)
-    syncInterval: 15000,     // 15 секунд (было 8)
-    conflictResolve: 'timestamp',
-    initializationDelay: 10000 // 10 секунд на инициализацию
-  },
-
-  replication: {
-    factor: 2,              // Репликация на 2 storage узла
-    sharding: 'hash',
-    backupInterval: 5 * 60 * 1000  // 5 минут
-  },
-
-  // 🚀 Render-specific optimizations
-  render: {
-    coldStartDelay: 30000,   // 30 секунд на cold start
-    maxRetries: 5,
-    keepWarm: true
+// Парсинг поста из сообщения группы
+const parsePost = (message) => {
+  try {
+    const text = message.text;
+    
+    // Проверяем формат POST::
+    if (!text || !text.startsWith('POST::')) {
+      return null;
+    }
+    
+    // Извлекаем JSON часть после первой строки
+    const lines = text.split('\n');
+    if (lines.length < 2) return null;
+    
+    const jsonData = lines.slice(1).join('\n');
+    const post = JSON.parse(jsonData);
+    
+    // Проверяем что это пост
+    if (post.t !== 'post') return null;
+    
+    return post;
+  } catch (error) {
+    console.error('❌ Error parsing post:', error);
+    return null;
   }
 };
 
-// ========================= DISTRIBUTED STORAGE ENGINE =========================
-
-class DistributedStorage {
-  constructor(nodeId) {
-    this.nodeId = nodeId;
-    this.role = this.determineRole();
-    this.localData = new Map();
-    this.replicatedData = new Map();
-    this.metadata = new Map();
-    this.peers = new Map();
-
-    this.state = {
-      isLeader: false,
-      lastSync: Date.now(),
-      version: 0,
-      health: 'initializing',
-      isInitialized: false
-    };
-
-    this.conflictLog = [];
-    this.lastHeartbeat = new Map();
-    this.connectionAttempts = new Map();
-    this.initializationStartTime = Date.now();
-
-    // 🔄 Delayed initialization for better cold start handling
-    setTimeout(() => {
-      this.initializeNode();
-    }, NETWORK_CONFIG.render.coldStartDelay);
-  }
-
-  determineRole() {
-    const envRole = process.env.NODE_ROLE;
-    if (envRole && ['master', 'storage', 'gateway'].includes(envRole)) {
-      return envRole;
-    }
-
-    // 🎯 Simplified role assignment based on nodeId
-    if (this.nodeId.includes('master')) return 'master';
-    if (this.nodeId.includes('storage')) return 'storage';
-    if (this.nodeId.includes('gateway')) return 'gateway';
-
-    // Hash-based fallback
-    const hash = crypto.createHash('sha256').update(this.nodeId).digest('hex');
-    const hashValue = parseInt(hash.slice(0, 8), 16);
-    const position = (hashValue % 1000) / 1000;
-
-    if (position < 0.25) return 'master';
-    if (position < 0.75) return 'storage'; 
-    return 'gateway';
-  }
-
-  async initializeNode() {
-    console.log(`🌊 Node ${this.nodeId} starting as ${this.role}`);
-    
-    this.state.health = 'connecting';
-    
-    // 🔄 Sequential connection with delays for better stability
-    await this.connectToPeersSequentially();
-    
-    // ⏰ Wait for peer introductions
-    await this.waitForPeerIntroductions();
-    
-    this.startConsensusLoop();
-    this.startKeepAlive();
-    this.initializeRoleServices();
-    
-    this.state.isInitialized = true;
-    this.state.health = 'healthy';
-    
-    console.log(`✅ Node ${this.nodeId} fully initialized`);
-  }
-
-  async connectToPeersSequentially() {
-    for (const [index, peerUrl] of NETWORK_CONFIG.peers.entries()) {
-      if (!peerUrl || peerUrl.includes(this.nodeId)) continue;
-
-      // 🌊 Staggered connection delays for graceful startup
-      const delay = index * 2000; // 2 секунды между подключениями
-      
-      setTimeout(async () => {
-        await this.connectToPeer(peerUrl);
-      }, delay);
-    }
-  }
-
-  async connectToPeer(peerUrl) {
-    if (this.connectionAttempts.get(peerUrl) >= NETWORK_CONFIG.render.maxRetries) {
-      console.log(`❌ Max retries reached for ${peerUrl}`);
-      return;
-    }
-
-    try {
-      let wsUrl = peerUrl;
-      if (peerUrl.startsWith('https://')) {
-        wsUrl = peerUrl.replace('https://', 'wss://');
-      } else if (peerUrl.startsWith('http://')) {
-        wsUrl = peerUrl.replace('http://', 'ws://');
-      }
-
-      if (!wsUrl.includes('/ws') && !wsUrl.endsWith('/')) {
-        wsUrl = wsUrl + '/ws';
-      }
-
-      console.log(`🔗 Connecting to: ${wsUrl}`);
-
-      const ws = new WebSocket(wsUrl);
-      const connectTimeout = setTimeout(() => {
-        console.log(`⏰ Connection timeout for ${peerUrl}`);
-        ws.terminate();
-      }, NETWORK_CONFIG.keepAlive.peerTimeout);
-
-      ws.on('open', () => {
-        clearTimeout(connectTimeout);
-        console.log(`🤝 Connected to peer: ${peerUrl}`);
-        
-        this.peers.set(peerUrl, {
-          ws,
-          lastSeen: Date.now(),
-          health: 'connected',
-          nodeId: null,
-          role: null,
-          introducedAt: null
-        });
-
-        // 🔄 Send introduction immediately
-        this.sendToPeer(ws, {
-          type: 'node_intro',
-          nodeId: this.nodeId,
-          role: this.role,
-          timestamp: Date.now(),
-          version: this.state.version
-        });
-
-        // Reset connection attempts on success
-        this.connectionAttempts.set(peerUrl, 0);
-      });
-
-      ws.on('message', (data) => this.handlePeerMessage(peerUrl, data));
-      ws.on('close', () => this.handlePeerDisconnect(peerUrl));
-      ws.on('error', (error) => {
-        clearTimeout(connectTimeout);
-        console.log(`❌ WebSocket error for ${peerUrl}:`, error.message);
-        
-        const attempts = this.connectionAttempts.get(peerUrl) || 0;
-        this.connectionAttempts.set(peerUrl, attempts + 1);
-        
-        setTimeout(() => {
-          this.reconnectToPeer(peerUrl);
-        }, NETWORK_CONFIG.keepAlive.reconnectDelay * (attempts + 1));
-      });
-
-    } catch (error) {
-      console.log(`❌ Failed to connect to ${peerUrl}:`, error.message);
-      
-      const attempts = this.connectionAttempts.get(peerUrl) || 0;
-      this.connectionAttempts.set(peerUrl, attempts + 1);
-    }
-  }
-
-  async waitForPeerIntroductions() {
-    const maxWait = 30000; // 30 секунд ожидания
-    const checkInterval = 1000; // Проверяем каждую секунду
-    let waited = 0;
-
-    while (waited < maxWait) {
-      const introducedPeers = Array.from(this.peers.values())
-        .filter(peer => peer.nodeId && peer.role && peer.introducedAt);
-      
-      console.log(`🔍 Waiting for introductions: ${introducedPeers.length}/${this.peers.size} peers ready`);
-      
-      if (introducedPeers.length >= Math.min(2, this.peers.size)) {
-        console.log(`✅ Sufficient peer introductions received`);
-        break;
-      }
-      
-      await new Promise(resolve => setTimeout(resolve, checkInterval));
-      waited += checkInterval;
-    }
-  }
-
-  handlePeerMessage(peerUrl, data) {
-    try {
-      const message = JSON.parse(data.toString());
-
-      switch (message.type) {
-        case 'node_intro':
-          this.handleNodeIntro(peerUrl, message);
-          break;
-        case 'query_request':
-          this.handleQueryRequest(peerUrl, message);
-          break;
-        case 'consensus_proposal':
-          this.handleConsensusProposal(message);
-          break;
-        case 'nostr_event':
-          this.handleNostrEvent(message);
-          break;
-        case 'data_sync':
-          this.handleDataSync(message);
-          break;
-        case 'heartbeat':
-          this.handleHeartbeat(peerUrl, message);
-          break;
-        case 'sync_request':
-          this.handleSyncRequest(peerUrl, message);
-          break;
-        case 'sync_response':
-          this.handleSyncResponse(message);
-          break;
-        case 'post_expired':
-          this.handlePostExpired(message);
-          break;
-      }
-    } catch (error) {
-      console.log('❌ Error handling peer message:', error);
-    }
-  }
-
-  handleNodeIntro(peerUrl, message) {
-    const peer = this.peers.get(peerUrl);
-    if (peer) {
-      peer.nodeId = message.nodeId;
-      peer.role = message.role;
-      peer.lastSeen = Date.now();
-      peer.introducedAt = Date.now();
-      
-      console.log(`👋 Peer introduced: ${message.nodeId} (${message.role})`);
-
-      // 🔄 Send our introduction back if not already sent
-      this.sendToPeer(peer.ws, {
-        type: 'node_intro_ack',
-        nodeId: this.nodeId,
-        role: this.role,
-        timestamp: Date.now(),
-        version: this.state.version
-      });
-
-      // 📦 Request initial data sync
-      this.requestDataSync(peer.ws);
-    }
-  }
-
-  getActivePeers() {
-    const now = Date.now();
-    const timeout = NETWORK_CONFIG.keepAlive.peerTimeout;
-
-    return Array.from(this.peers.entries())
-      .filter(([url, peer]) => {
-        const isRecentlySeen = now - peer.lastSeen < timeout;
-        const hasNodeId = peer.nodeId && peer.nodeId !== this.nodeId;
-        const isIntroduced = peer.introducedAt !== null;
-        
-        return isRecentlySeen && hasNodeId && isIntroduced;
-      })
-      .map(([url, peer]) => ({ 
-        url, 
-        nodeId: peer.nodeId, 
-        role: peer.role, 
-        ...peer 
-      }));
-  }
-
-  startConsensusLoop() {
-    // 🔄 More conservative consensus timing
-    setInterval(() => {
-      if (this.state.isInitialized) {
-        this.performConsensusRound();
-      }
-    }, NETWORK_CONFIG.consensus.syncInterval);
-
-    setInterval(() => {
-      if (this.state.isInitialized) {
-        this.electLeader();
-      }
-    }, FIBONACCI[7] * 1000);
-  }
-
-  async performConsensusRound() {
-    const activePeers = this.getActivePeers();
-
-    if (activePeers.length < NETWORK_CONFIG.consensus.quorum - 1) {
-      if (this.state.isInitialized) {
-        console.log(`⚠️ Insufficient peers for consensus: ${activePeers.length}/${NETWORK_CONFIG.consensus.quorum - 1} required`);
-      }
-      return;
-    }
-
-    const proposal = {
-      type: 'consensus_proposal',
-      nodeId: this.nodeId,
-      version: this.state.version + 1,
-      changes: this.getPendingChanges(),
-      timestamp: Date.now()
-    };
-
-    this.broadcastToPeers(proposal);
-  }
-
-  electLeader() {
-    const activePeers = this.getActivePeers();
-    const candidates = [this.nodeId, ...activePeers.map(p => p.nodeId)]
-      .filter(Boolean)
-      .sort();
-    
-    const leader = candidates[0];
-    const wasLeader = this.state.isLeader;
-    this.state.isLeader = (leader === this.nodeId);
-
-    if (this.state.isLeader && !wasLeader) {
-      console.log(`👑 Node ${this.nodeId} became leader`);
-      this.onBecomeLeader();
-    }
-  }
-
-  onBecomeLeader() {
-    this.startDataSynchronization();
-    this.startConflictResolution();
-    this.coordinateReplication();
-  }
-
-  startKeepAlive() {
-    setInterval(() => {
-      this.pingAllPeers();
-      this.checkNetworkHealth();
-    }, NETWORK_CONFIG.keepAlive.interval);
-
-    // 🔄 Self-ping to prevent Render cold start
-    if (NETWORK_CONFIG.render.keepWarm && NETWORK_CONFIG.keepAlive.pingUrl) {
-      setInterval(async () => {
-        try {
-          const response = await fetch(NETWORK_CONFIG.keepAlive.pingUrl + '/heartbeat');
-          console.log(`💓 Self-ping: ${response.status}`);
-        } catch (error) {
-          console.log('⚠️ Self-ping failed:', error.message);
-        }
-      }, 10 * 60 * 1000); // Каждые 10 минут
-    }
-  }
-
-  checkNetworkHealth() {
-    const activePeers = this.getActivePeers();
-    const peerCount = activePeers.length;
-    const totalPeers = NETWORK_CONFIG.peers.length - 1; // -1 для исключения себя
-
-    console.log(`💓 Network health: ${peerCount}/${totalPeers} nodes active`);
-
-    if (peerCount < NETWORK_CONFIG.consensus.quorum - 1) {
-      if (this.state.health !== 'degraded') {
-        console.log('⚠️ Network partition detected - entering degraded mode');
-        this.state.health = 'degraded';
-      }
-    } else {
-      this.state.health = 'healthy';
-    }
-  }
-
-  pingAllPeers() {
-    const heartbeat = {
-      type: 'heartbeat',
-      nodeId: this.nodeId,
-      timestamp: Date.now(),
-      health: this.state.health,
-      role: this.role
-    };
-    this.broadcastToPeers(heartbeat);
-  }
-
-  sendToPeer(ws, message) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(message));
-    }
-  }
-
-  broadcastToPeers(message) {
-    for (const peer of this.peers.values()) {
-      this.sendToPeer(peer.ws, message);
-    }
-  }
-
-  handleHeartbeat(peerUrl, message) {
-    const peer = this.peers.get(peerUrl);
-    if (peer) {
-      peer.lastSeen = Date.now();
-      peer.health = message.health || 'unknown';
-    }
-  }
-
-  async reconnectToPeer(peerUrl) {
-    console.log(`🔄 Attempting to reconnect to ${peerUrl}`);
-    
-    const peer = this.peers.get(peerUrl);
-    if (peer && peer.ws.readyState === WebSocket.CLOSED) {
-      this.peers.delete(peerUrl);
-      await this.connectToPeer(peerUrl);
-    }
-  }
-
-  handlePeerDisconnect(peerUrl) {
-    console.log(`💔 Peer disconnected: ${peerUrl}`);
-    const peer = this.peers.get(peerUrl);
-    if (peer) {
-      peer.health = 'disconnected';
-      peer.lastSeen = Date.now();
-    }
-
-    // 🔄 Schedule reconnection
-    setTimeout(() => {
-      this.reconnectToPeer(peerUrl);
-    }, NETWORK_CONFIG.keepAlive.reconnectDelay);
-  }
-
-  // ============= ROLE-SPECIFIC SERVICES =============
-
-  initializeRoleServices() {
-    switch (this.role) {
-      case 'master':
-        this.startMasterServices();
-        break;
-      case 'storage':
-        this.startStorageServices();
-        break;
-      case 'gateway':
-        this.startGatewayServices();
-        break;
-    }
-  }
-
-  startMasterServices() {
-    console.log('👑 Starting master node services');
-    
-    // 🎯 Master coordinates the network
-    setInterval(() => {
-      this.checkNetworkHealth();
-      this.coordinateDataDistribution();
-    }, FIBONACCI[7] * 1000);
-  }
-
-  startStorageServices() {
-    console.log('📦 Starting storage node services');
-    
-    // 🗄️ Storage handles data persistence and replication
-    this.initializeDataSharding();
-    this.startReplicationService();
-  }
-
-  startGatewayServices() {
-    console.log('🌐 Starting gateway node services');
-    
-    // 🔀 Gateway handles client connections and load balancing
-    this.setupClientRouting();
-    this.startLoadBalancing();
-  }
-
-  // ============= PLACEHOLDER METHODS (implement as needed) =============
-  
-  cleanupOldPosts() { /* Implementation */ }
-  selectStorageNodes(eventId) { return { primary: 'storage-001', replica: 'storage-002' }; }
-  addNostrEvent(event) { /* Implementation */ }
-  queryNostrEvents(filters) { /* Implementation */ }
-  convertNostrEventToPost(event) { /* Implementation */ }
-  convertPostToNostrEvent(post) { /* Implementation */ }
-  eventMatchesFilters(event, filters) { /* Implementation */ }
-  handleQueryRequest(peerUrl, message) { /* Implementation */ }
-  handleConsensusProposal(message) { /* Implementation */ }
-  handleNostrEvent(message) { /* Implementation */ }
-  handleDataSync(message) { /* Implementation */ }
-  handleSyncRequest(peerUrl, message) { /* Implementation */ }
-  handleSyncResponse(message) { /* Implementation */ }
-  handlePostExpired(message) { /* Implementation */ }
-  requestDataSync(ws) { /* Implementation */ }
-  getPendingChanges() { return []; }
-  startDataSynchronization() { /* Implementation */ }
-  startConflictResolution() { /* Implementation */ }
-  coordinateReplication() { /* Implementation */ }
-  coordinateDataDistribution() { /* Implementation */ }
-  initializeDataSharding() { /* Implementation */ }
-  startReplicationService() { /* Implementation */ }
-  setupClientRouting() { /* Implementation */ }
-  startLoadBalancing() { /* Implementation */ }
-}
-
-// ========================= EXPRESS API LAYER =========================
-
-class DistributedAPI {
-  constructor(storage) {
-    this.storage = storage;
-    this.app = express();
-    this.wss = null;
-    this.setupMiddleware();
-    this.setupRoutes();
-  }
-
-  setupMiddleware() {
-    this.app.use(express.json({ limit: '1mb' }));
-    this.app.use((req, res, next) => {
-      res.header('Access-Control-Allow-Origin', '*');
-      res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.header('Access-Control-Allow-Headers', 'Content-Type');
-      next();
-    });
-  }
-
-  setupRoutes() {
-    // Health check with detailed network status
-    this.app.get('/heartbeat', (req, res) => {
-      const activePeers = this.storage.getActivePeers();
-      
-      res.json({
-        status: 'alive',
-        nodeId: this.storage.nodeId,
-        role: this.storage.role,
-        timestamp: Date.now(),
-        network: {
-          activePeers: activePeers.length,
-          totalPeers: NETWORK_CONFIG.peers.length - 1,
-          health: this.storage.state.health,
-          isLeader: this.storage.state.isLeader,
-          initialized: this.storage.state.isInitialized
-        },
-        peers: activePeers.map(p => ({
-          nodeId: p.nodeId,
-          role: p.role,
-          health: p.health
-        }))
-      });
-    });
-
-    // Main route
-    this.app.get('/', (req, res) => {
-      const activePeers = this.storage.getActivePeers();
-      
-      res.json({
-        service: 'Distributed Nostr Relay',
-        node: this.storage.nodeId,
-        role: this.storage.role,
-        network: `${activePeers.length}/${NETWORK_CONFIG.peers.length - 1} nodes`,
-        status: this.storage.state.health,
-        initialized: this.storage.state.isInitialized,
-        websocket: `wss://${req.headers.host}/ws`
-      });
-    });
-
-    // Network status
-    this.app.get('/api/network', (req, res) => {
-      const activePeers = this.storage.getActivePeers();
-      
-      res.json({
-        nodeId: this.storage.nodeId,
-        role: this.storage.role,
-        isLeader: this.storage.state.isLeader,
-        initialized: this.storage.state.isInitialized,
-        health: this.storage.state.health,
-        peers: activePeers,
-        network: {
-          topology: NETWORK_CONFIG.topology,
-          consensus: {
-            quorum: NETWORK_CONFIG.consensus.quorum,
-            version: this.storage.state.version
-          },
-          uptime: Date.now() - this.storage.initializationStartTime
-        }
-      });
-    });
-  }
-
-  setupWebSocketServer(server) {
-    this.wss = new WebSocketServer({
-      server,
-      path: '/ws'
-    });
-
-    this.wss.on('connection', (ws, req) => {
-      const clientIp = req.socket.remoteAddress;
-      console.log(`🔌 Client connected from ${clientIp} to ${this.storage.role} node`);
-
-      ws.send(JSON.stringify(['NOTICE', `Connected to distributed Nostr relay (${this.storage.role} node)`]));
-
-      ws.on('message', async (data) => {
-        try {
-          const message = JSON.parse(data.toString());
-          
-          if (!Array.isArray(message)) {
-            ws.send(JSON.stringify(['NOTICE', 'Invalid message format - expected array']));
-            return;
-          }
-
-          const [type, ...params] = message;
-
-          switch (type) {
-            case 'EVENT':
-              await this.handleNostrEvent(ws, params[0]);
-              break;
-            case 'REQ':
-              await this.handleNostrRequest(ws, params[0], params.slice(1));
-              break;
-            case 'CLOSE':
-              this.handleNostrClose(ws, params[0]);
-              break;
-            default:
-              ws.send(JSON.stringify(['NOTICE', `Unknown message type: ${type}`]));
-          }
-        } catch (error) {
-          console.error('❌ Error processing Nostr message:', error);
-          ws.send(JSON.stringify(['NOTICE', 'Error processing message']));
-        }
-      });
-
-      ws.on('close', () => {
-        console.log(`💔 Client disconnected from ${this.storage.role} node`);
-      });
-
-      ws.on('error', (error) => {
-        console.error('❌ WebSocket error:', error);
-      });
-    });
-  }
-
-  // Placeholder Nostr handlers
-  async handleNostrEvent(ws, event) {
-    ws.send(JSON.stringify(['OK', event?.id || '', true, '']));
-  }
-
-  async handleNostrRequest(ws, subscriptionId, filters) {
-    ws.send(JSON.stringify(['EOSE', subscriptionId]));
-  }
-
-  handleNostrClose(ws, subscriptionId) {
-    console.log(`🔒 Subscription ${subscriptionId} closed`);
-  }
-
-  start(port = 8080) {
-    const server = this.app.listen(port, '0.0.0.0', () => {
-      console.log(`🌊 Distributed node ${this.storage.nodeId} (${this.storage.role}) running on port ${port}`);
-    });
-
-    this.setupWebSocketServer(server);
-    return server;
-  }
-}
-
-// ========================= INITIALIZATION =========================
-
-async function initializeDistributedNode() {
-  console.log('🌊 Initializing distributed Nostr node...');
-
-  const storage = new DistributedStorage(NETWORK_CONFIG.nodeId);
-  const api = new DistributedAPI(storage);
-  const server = api.start();
-
-  process.on('SIGTERM', () => {
-    console.log('🛑 Graceful shutdown initiated');
-    server.close(() => {
-      console.log('✅ Node shutdown complete');
-      process.exit(0);
-    });
+// Генерация ID для нового поста
+const generateId = () => {
+  return Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+};
+
+// ========================= API ENDPOINTS =========================
+
+// Главная страница - информация о боте
+app.get('/', (req, res) => {
+  res.json({
+    service: 'Bot #4 - Feed Server',
+    role: 'Пагинация для новых пользователей',
+    group: GROUP_ID,
+    status: 'active',
+    version: '1.0.0',
+    endpoints: {
+      '/api/feed': 'Получение ленты постов',
+      '/api/feed/latest': 'Последние посты', 
+      '/api/posts/:id': 'Получение конкретного поста',
+      '/api/test-post': 'Создание тестового поста'
+    },
+    timestamp: new Date().toISOString()
   });
+});
 
-  console.log('🚀 Distributed node initialization complete');
-  console.log(`📊 Network topology: ${NETWORK_CONFIG.topology}`);
-  console.log(`🎯 Node role: ${storage.role}`);
-}
+// Health check
+app.get('/heartbeat', (req, res) => {
+  res.json({
+    status: 'alive',
+    bot: 'feed-server',
+    timestamp: Date.now(),
+    group: GROUP_ID
+  });
+});
 
-if (require.main === module) {
-  initializeDistributedNode().catch(console.error);
-}
+// Получение ленты постов с пагинацией
+app.get('/api/feed', async (req, res) => {
+  try {
+    const { 
+      page = 1, 
+      limit = 20,
+      city,
+      tag,
+      gender,
+      search 
+    } = req.query;
 
-module.exports = { DistributedStorage, DistributedAPI, NETWORK_CONFIG };
+    console.log(`📋 Feed request: page=${page}, limit=${limit}, filters:`, { city, tag, gender, search });
+
+    // Получаем сообщения из группы
+    const messages = await bot.getChatHistory(GROUP_ID, {
+      limit: parseInt(limit) * 5, // Берем больше для фильтрации
+      offset: (parseInt(page) - 1) * parseInt(limit) * 5
+    });
+
+    console.log(`📥 Retrieved ${messages.length} messages from group`);
+
+    // Парсим и фильтруем посты
+    let posts = [];
+    for (const message of messages) {
+      const post = parsePost(message);
+      if (post) {
+        posts.push(post);
+      }
+    }
+
+    console.log(`✅ Parsed ${posts.length} valid posts`);
+
+    // Применяем фильтры
+    if (city && city !== 'all') {
+      posts = posts.filter(post => post.meta?.city === city);
+    }
+    
+    if (tag && tag !== 'all') {
+      posts = posts.filter(post => post.meta?.tag === tag);
+    }
+    
+    if (gender && gender !== 'all') {
+      posts = posts.filter(post => post.meta?.gender === gender);
+    }
+    
+    if (search) {
+      const searchLower = search.toLowerCase();
+      posts = posts.filter(post => 
+        post.title?.toLowerCase().includes(searchLower) ||
+        post.content?.toLowerCase().includes(searchLower)
+      );
+    }
+
+    // Сортируем по времени (новые первые)
+    posts.sort((a, b) => b.ts - a.ts);
+
+    // Пагинация
+    const startIndex = (parseInt(page) - 1) * parseInt(limit);
+    const endIndex = startIndex + parseInt(limit);
+    const paginatedPosts = posts.slice(startIndex, endIndex);
+    
+    const hasMore = posts.length > endIndex;
+
+    console.log(`📤 Returning ${paginatedPosts.length} posts (hasMore: ${hasMore})`);
+
+    res.json({
+      posts: paginatedPosts,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: posts.length,
+        hasMore
+      },
+      filters: { city, tag, gender, search },
+      timestamp: Date.now()
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching feed:', error);
+    res.status(500).json({
+      error: 'Failed to fetch feed',
+      message: error.message,
+      timestamp: Date.now()
+    });
+  }
+});
+
+// Получение последних постов (без пагинации)
+app.get('/api/feed/latest', async (req, res) => {
+  try {
+    const { limit = 10 } = req.query;
+
+    const messages = await bot.getChatHistory(GROUP_ID, {
+      limit: parseInt(limit) * 3 // Берем больше для парсинга
+    });
+
+    const posts = [];
+    for (const message of messages) {
+      const post = parsePost(message);
+      if (post && posts.length < parseInt(limit)) {
+        posts.push(post);
+      }
+    }
+
+    // Сортируем по времени
+    posts.sort((a, b) => b.ts - a.ts);
+
+    res.json({
+      posts: posts.slice(0, parseInt(limit)),
+      count: posts.length,
+      timestamp: Date.now()
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching latest posts:', error);
+    res.status(500).json({
+      error: 'Failed to fetch latest posts',
+      message: error.message
+    });
+  }
+});
+
+// Получение конкретного поста по ID
+app.get('/api/posts/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Ищем пост по ID в истории группы
+    const messages = await bot.getChatHistory(GROUP_ID, {
+      limit: 1000 // Берем больше сообщений для поиска
+    });
+
+    for (const message of messages) {
+      const post = parsePost(message);
+      if (post && post.id === id) {
+        return res.json({
+          post,
+          found: true,
+          timestamp: Date.now()
+        });
+      }
+    }
+
+    res.status(404).json({
+      error: 'Post not found',
+      id,
+      timestamp: Date.now()
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching post:', error);
+    res.status(500).json({
+      error: 'Failed to fetch post',
+      message: error.message
+    });
+  }
+});
+
+// Создание тестового поста
+app.post('/api/test-post', async (req, res) => {
+  try {
+    const {
+      title = 'Тестовый пост от Bot #4',
+      content = 'Это тестовый пост для проверки работы системы',
+      city = 'moscow',
+      tag = 'general',
+      gender = 'male'
+    } = req.body;
+
+    const testPost = {
+      t: 'post',
+      id: generateId(),
+      title,
+      content,
+      author: {
+        id: 'bot_4_test',
+        name: 'Bot #4 Test',
+        photo: '',
+        username: 'bot4_test'
+      },
+      meta: {
+        city,
+        tag,
+        gender,
+        age: '25-35'
+      },
+      ts: Date.now(),
+      likes: 0,
+      views: 0
+    };
+
+    // Формируем сообщение для группы
+    const messageText = `POST::${testPost.id}::${testPost.ts}\n${JSON.stringify(testPost, null, 2)}`;
+
+    // Отправляем в группу
+    await bot.sendMessage(GROUP_ID, messageText);
+
+    console.log('✅ Test post created:', testPost.id);
+
+    res.json({
+      success: true,
+      post: testPost,
+      message: 'Test post created successfully',
+      timestamp: Date.now()
+    });
+
+  } catch (error) {
+    console.error('❌ Error creating test post:', error);
+    res.status(500).json({
+      error: 'Failed to create test post',
+      message: error.message
+    });
+  }
+});
+
+// ========================= СТАТИСТИКА =========================
+
+app.get('/api/stats', async (req, res) => {
+  try {
+    // Получаем последние сообщения для анализа
+    const messages = await bot.getChatHistory(GROUP_ID, {
+      limit: 1000
+    });
+
+    let postsCount = 0;
+    let likesCount = 0;
+    let usersCount = new Set();
+
+    for (const message of messages) {
+      const text = message.text;
+      if (!text) continue;
+
+      if (text.startsWith('POST::')) {
+        postsCount++;
+        const post = parsePost(message);
+        if (post?.author?.id) {
+          usersCount.add(post.author.id);
+        }
+      } else if (text.startsWith('LIKE::')) {
+        likesCount++;
+      }
+    }
+
+    res.json({
+      posts: postsCount,
+      likes: likesCount,
+      users: usersCount.size,
+      messagesAnalyzed: messages.length,
+      timestamp: Date.now()
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching stats:', error);
+    res.status(500).json({
+      error: 'Failed to fetch stats',
+      message: error.message
+    });
+  }
+});
+
+// ========================= ЗАПУСК СЕРВЕРА =========================
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('🤖 Bot #4 - Feed Server started');
+  console.log(`📡 Server running on port ${PORT}`);
+  console.log(`📱 Group ID: ${GROUP_ID}`);
+  console.log(`🔗 API URL: https://six-z05l.onrender.com`);
+  console.log('');
+  console.log('📋 Available endpoints:');
+  console.log('  GET  /api/feed - Feed with pagination');
+  console.log('  GET  /api/feed/latest - Latest posts');
+  console.log('  GET  /api/posts/:id - Get specific post');
+  console.log('  POST /api/test-post - Create test post');
+  console.log('  GET  /api/stats - Statistics');
+  console.log('');
+});
+
+// Обработка ошибок
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error('❌ Unhandled Rejection:', error);
+});
+
+module.exports = app;
