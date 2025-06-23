@@ -634,67 +634,140 @@ async function handleTelegramSync(msg) {
 // Receive commands from BOT1
 app.post('/api/webhook/command', async (req, res) => {
   try {
-    const { type, eventId, data } = req.body
+    const { type, eventId, data, timestamp, source } = req.body
     
-    console.log(`📨 Webhook command: ${type} for event ${eventId}`)
+    console.log(`📨 Webhook from ${source}: ${type} for event ${eventId}`)
     
     switch (type) {
+      case 'NEW_EVENT':
+        await handleNewEvent(eventId, data.event)
+        break
       case 'UPDATE_LIKES':
-        await handleLikeUpdate(eventId, data.likes)
+        await handleLikeUpdate(eventId, data.likes, data.isLiked)
         break
       case 'DELETE_EVENT':
         await handleEventDelete(eventId)
         break
       case 'UPDATE_EVENT':
-        await handleEventUpdate(eventId, data)
+        await handleEventUpdate(eventId, data.updates || data)
         break
       default:
-        console.log(`Unknown webhook command: ${type}`)
+        console.log(`❓ Unknown webhook command: ${type}`)
     }
     
-    res.json({ success: true })
+    res.json({ 
+      success: true, 
+      processed: type,
+      eventId,
+      timestamp: Date.now()
+    })
     
   } catch (error) {
-    console.error('Webhook error:', error)
-    res.status(500).json({ error: 'Webhook failed' })
+    console.error('❌ Webhook error:', error)
+    res.status(500).json({ error: 'Webhook failed: ' + error.message })
   }
 })
 
-async function handleLikeUpdate(eventId, newLikes) {
-  // Find event in cache and update likes
-  const eventIndex = eventsCache.findIndex(e => e.id === eventId)
-  if (eventIndex !== -1) {
-    eventsCache[eventIndex].likes = newLikes
+async function handleNewEvent(eventId, eventData) {
+  try {
+    console.log(`➕ Adding new event to cache: ${eventData.title}`)
     
-    // Broadcast update to all clients
-    broadcast('EVENT_UPDATED', {
-      id: eventId,
-      likes: newLikes,
-      type: 'likes'
-    })
+    // Add to cache (at the beginning for newest first)
+    eventsCache.unshift(eventData)
+    
+    // Remove duplicates if any
+    const uniqueEvents = []
+    const seenIds = new Set()
+    
+    for (const event of eventsCache) {
+      if (!seenIds.has(event.id)) {
+        seenIds.add(event.id)
+        uniqueEvents.push(event)
+      }
+    }
+    
+    eventsCache = uniqueEvents
+    
+    // Broadcast to all connected clients
+    broadcast('EVENT_CREATED', eventData)
+    
+    console.log(`✅ New event added to cache: ${eventData.title}`)
+    
+  } catch (error) {
+    console.error('❌ Error handling new event:', error)
+  }
+}
+
+async function handleLikeUpdate(eventId, newLikes, isLiked) {
+  try {
+    // Find event in cache and update likes
+    const eventIndex = eventsCache.findIndex(e => e.id === eventId)
+    if (eventIndex !== -1) {
+      const oldLikes = eventsCache[eventIndex].likes
+      eventsCache[eventIndex].likes = newLikes
+      eventsCache[eventIndex].updatedAt = new Date().toISOString()
+      
+      console.log(`⚡ Updated likes for ${eventId}: ${oldLikes} → ${newLikes}`)
+      
+      // Broadcast update to all clients
+      broadcast('EVENT_LIKED', {
+        id: eventId,
+        likes: newLikes,
+        isLiked: isLiked,
+        type: 'likes'
+      })
+    } else {
+      console.log(`⚠️ Event ${eventId} not found in cache for like update`)
+    }
+  } catch (error) {
+    console.error('❌ Error updating likes:', error)
   }
 }
 
 async function handleEventDelete(eventId) {
-  // Remove from cache
-  eventsCache = eventsCache.filter(e => e.id !== eventId)
-  
-  // Broadcast deletion to all clients
-  broadcast('EVENT_DELETED', { id: eventId })
+  try {
+    // Remove from cache
+    const initialLength = eventsCache.length
+    eventsCache = eventsCache.filter(e => e.id !== eventId)
+    
+    if (eventsCache.length < initialLength) {
+      console.log(`🗑️ Deleted event ${eventId} from cache`)
+      
+      // Broadcast deletion to all clients
+      broadcast('EVENT_DELETED', { id: eventId })
+    } else {
+      console.log(`⚠️ Event ${eventId} not found in cache for deletion`)
+    }
+  } catch (error) {
+    console.error('❌ Error deleting event:', error)
+  }
 }
 
 async function handleEventUpdate(eventId, updates) {
-  // Update in cache
-  const eventIndex = eventsCache.findIndex(e => e.id === eventId)
-  if (eventIndex !== -1) {
-    eventsCache[eventIndex] = { ...eventsCache[eventIndex], ...updates }
-    
-    // Broadcast update to all clients
-    broadcast('EVENT_UPDATED', {
-      id: eventId,
-      ...updates,
-      type: 'content'
-    })
+  try {
+    // Update in cache
+    const eventIndex = eventsCache.findIndex(e => e.id === eventId)
+    if (eventIndex !== -1) {
+      const oldEvent = eventsCache[eventIndex]
+      eventsCache[eventIndex] = { 
+        ...oldEvent, 
+        ...updates, 
+        updatedAt: new Date().toISOString() 
+      }
+      
+      console.log(`✏️ Updated event ${eventId}: ${oldEvent.title}`)
+      
+      // Broadcast update to all clients
+      broadcast('EVENT_UPDATED', {
+        id: eventId,
+        ...updates,
+        type: 'content'
+      })
+    } else {
+      console.log(`⚠️ Event ${eventId} not found in cache for update`)
+    }
+  } catch (error) {
+    console.error('❌ Error updating event:', error)
   }
 }
 
@@ -706,7 +779,8 @@ app.get('/health', (req, res) => {
     eventsCount: eventsCache.length,
     clients: clients.size,
     lastSync: lastSyncTime,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    bot1Url: BOT1_URL
   })
 })
 
@@ -717,8 +791,60 @@ app.get('/api/debug', (req, res) => {
     clients: clients.size,
     lastSync: new Date(lastSyncTime).toISOString(),
     cacheAge: Date.now() - lastSyncTime,
-    sampleEvents: eventsCache.slice(0, 3)
+    sampleEvents: eventsCache.slice(0, 3),
+    bot1Url: BOT1_URL
   })
+})
+
+// Sync with BOT1 SQLite database
+app.post('/api/sync-with-bot1', async (req, res) => {
+  try {
+    console.log('🔄 Requesting sync with BOT1 SQLite...')
+    
+    const response = await fetch(`${BOT1_URL}/api/webhook/from-bot2`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'SYNC_REQUEST',
+        timestamp: Date.now()
+      }),
+      timeout: 10000
+    })
+    
+    if (!response.ok) {
+      throw new Error(`BOT1 responded with ${response.status}`)
+    }
+    
+    const data = await response.json()
+    
+    if (data.events) {
+      // Merge with current cache
+      const existingIds = new Set(eventsCache.map(e => e.id))
+      const newEvents = data.events.filter(e => !existingIds.has(e.id))
+      
+      eventsCache = [...eventsCache, ...newEvents]
+      console.log(`✅ Merged ${newEvents.length} events from BOT1 SQLite`)
+      
+      // Sort by creation date (newest first)
+      eventsCache.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      
+      broadcast('EVENTS_SYNCED', { 
+        count: eventsCache.length,
+        newFromBot1: newEvents.length,
+        timestamp: Date.now() 
+      })
+    }
+    
+    res.json({
+      success: true,
+      totalEvents: eventsCache.length,
+      newFromBot1: data.events?.length || 0
+    })
+    
+  } catch (error) {
+    console.error('❌ BOT1 sync error:', error)
+    res.status(500).json({ error: 'BOT1 sync failed: ' + error.message })
+  }
 })
 
 // ===== STARTUP =====
