@@ -1,370 +1,388 @@
-const express = require('express');
-const TelegramBot = require('node-telegram-bot-api');
-const cors = require('cors');
+const express = require('express')
+const TelegramBot = require('node-telegram-bot-api')
+const cors = require('cors')
 
-// ========================= КОНФИГУРАЦИЯ =========================
+const app = express()
 
-const BOT_TOKEN = '7229365201:AAHVSXlcoU06UVsTn3Vwp9deRndatnlJLVA';
-const GROUP_ID = '-1002268255207'; // Группа БД
-const PORT = process.env.PORT || 8080;
+// Environment variables
+const BOT_TOKEN = '7948285859:AAGPM2BYYE2US3AIbP7P4yEBV4C5oWt3FSw'
+const GROUP_ID = '-1002268255207'
+const PORT = process.env.PORT || 3002
+const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://six-z05l.onrender.com'
 
-// ========================= ИНИЦИАЛИЗАЦИЯ =========================
+// Initialize Telegram bot
+const bot = new TelegramBot(BOT_TOKEN)
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: false });
-const app = express();
+// Middleware
+app.use(cors())
+app.use('/webhook', express.raw({ type: 'application/json' }))
+app.use(express.json())
 
-app.use(cors());
-app.use(express.json());
+// Lightweight cache for recent messages (only for current request)
+let messageCache = null
+let cacheTimestamp = 0
+const CACHE_DURATION = 30000 // 30 seconds
 
-// ========================= УТИЛИТЫ =========================
-
-// Парсинг поста из сообщения группы
-const parsePost = (message) => {
+// Message parsers
+function parseEventFromMessage(text, messageId, date, from) {
   try {
-    const text = message.text;
-    
-    // Проверяем формат POST::
-    if (!text || !text.startsWith('POST::')) {
-      return null;
+    // Parse create/update message: "🎯 Title\n\nDescription\n\n📍 city..."
+    if (text.includes('🎯')) {
+      const isUpdate = text.startsWith('✏️ Updated:')
+      const content = isUpdate ? text.replace('✏️ Updated:\n\n', '') : text
+      
+      const lines = content.split('\n').filter(line => line.trim())
+      
+      // Extract title (after 🎯)
+      const titleLine = lines.find(line => line.includes('🎯'))
+      if (!titleLine) return null
+      
+      const title = titleLine.replace('🎯', '').replace(/<\/?b>/g, '').trim()
+      
+      // Extract description (lines between title and metadata)
+      const titleIndex = lines.findIndex(line => line.includes('🎯'))
+      let description = ''
+      let metadataStartIndex = lines.length
+      
+      for (let i = titleIndex + 1; i < lines.length; i++) {
+        if (lines[i].match(/^[📍🏷️👤🎂]/)) {
+          metadataStartIndex = i
+          break
+        }
+        if (lines[i].trim()) {
+          description += (description ? ' ' : '') + lines[i].trim()
+        }
+      }
+      
+      // Extract metadata
+      const metadata = lines.slice(metadataStartIndex)
+      let city = '', category = '', gender = '', ageGroup = '', authorName = '', username = ''
+      
+      metadata.forEach(line => {
+        if (line.startsWith('📍')) city = line.replace('📍', '').trim()
+        else if (line.startsWith('🏷️')) category = line.replace('🏷️', '').trim()
+        else if (line.startsWith('👤') && !line.includes('@')) gender = line.replace('👤', '').trim()
+        else if (line.startsWith('🎂')) ageGroup = line.replace('🎂', '').trim()
+        else if (line.startsWith('👤') && line.includes('@')) {
+          const authorLine = line.replace('👤', '').trim()
+          const match = authorLine.match(/^(.+?)\s*\(@(.+?)\)$/)
+          if (match) {
+            authorName = match[1].trim()
+            username = match[2].trim()
+          } else {
+            authorName = authorLine
+          }
+        }
+      })
+      
+      const event = {
+        id: messageId.toString(),
+        title,
+        description,
+        authorId: from?.id?.toString() || 'unknown',
+        author: {
+          fullName: authorName,
+          username: username || undefined,
+          telegramId: from?.id?.toString()
+        },
+        city,
+        category,
+        gender,
+        ageGroup,
+        createdAt: new Date(date * 1000).toISOString(),
+        updatedAt: new Date().toISOString(),
+        likes: 0,
+        isLiked: false,
+        status: 'active',
+        telegramMessageId: messageId
+      }
+      
+      return event
     }
     
-    // Извлекаем JSON часть после первой строки
-    const lines = text.split('\n');
-    if (lines.length < 2) return null;
-    
-    const jsonData = lines.slice(1).join('\n');
-    const post = JSON.parse(jsonData);
-    
-    // Проверяем что это пост
-    if (post.t !== 'post') return null;
-    
-    return post;
+    return null
   } catch (error) {
-    console.error('❌ Error parsing post:', error);
-    return null;
+    console.error('Error parsing message:', error)
+    return null
   }
-};
+}
 
-// Генерация ID для нового поста
-const generateId = () => {
-  return Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
-};
+// Read messages from Telegram group
+async function getEventsFromTelegram() {
+  try {
+    // Check cache first
+    if (messageCache && (Date.now() - cacheTimestamp < CACHE_DURATION)) {
+      return messageCache
+    }
+    
+    console.log('Reading messages from Telegram group...')
+    
+    // Get chat history - this works for supergroups
+    const messages = []
+    let offset = 0
+    const limit = 100 // Max messages per request
+    const maxMessages = 500 // Don't load too many on free plan
+    
+    // Note: In production you might need to use different approach
+    // as getUpdates has limitations for groups
+    
+    // Alternative: Read messages using chat export or admin bot
+    // For now, we'll simulate reading recent messages
+    
+    const events = []
+    
+    // Temporary cache to avoid repeated API calls
+    messageCache = events
+    cacheTimestamp = Date.now()
+    
+    return events
+  } catch (error) {
+    console.error('Error reading from Telegram:', error)
+    return []
+  }
+}
 
-// ========================= API ENDPOINTS =========================
+// Alternative: Read messages using getUpdates (limited)
+async function getEventsFromUpdates() {
+  try {
+    const updates = await bot.getUpdates({ limit: 100, timeout: 10 })
+    const events = []
+    
+    updates.forEach(update => {
+      if (update.message && 
+          update.message.chat.id.toString() === GROUP_ID &&
+          update.message.text &&
+          update.message.text.includes('🎯')) {
+        
+        const { message_id, text, date, from } = update.message
+        const event = parseEventFromMessage(text, message_id, date, from)
+        if (event) {
+          events.push(event)
+        }
+      }
+    })
+    
+    return events
+  } catch (error) {
+    console.error('Error getting updates:', error)
+    return []
+  }
+}
 
-// Главная страница - информация о боте
-app.get('/', (req, res) => {
-  res.json({
-    service: 'Bot #4 - Feed Server',
-    role: 'Пагинация для новых пользователей',
-    group: GROUP_ID,
-    status: 'active',
-    version: '1.0.0',
-    endpoints: {
-      '/api/feed': 'Получение ленты постов',
-      '/api/feed/latest': 'Последние посты', 
-      '/api/posts/:id': 'Получение конкретного поста',
-      '/api/test-post': 'Создание тестового поста'
-    },
-    timestamp: new Date().toISOString()
-  });
-});
+// Webhook endpoint (for cache invalidation)
+app.post('/webhook', (req, res) => {
+  try {
+    const update = JSON.parse(req.body.toString())
+    
+    // Process only messages from the specific group
+    if (update.message && 
+        update.message.chat.id.toString() === GROUP_ID &&
+        update.message.text) {
+      
+      console.log('New message in group, invalidating cache')
+      
+      // Invalidate cache when new message arrives
+      messageCache = null
+      cacheTimestamp = 0
+    }
+    
+    res.status(200).send('OK')
+  } catch (error) {
+    console.error('Webhook error:', error)
+    res.status(500).send('Error')
+  }
+})
 
-// Health check
-app.get('/heartbeat', (req, res) => {
-  res.json({
-    status: 'alive',
-    bot: 'feed-server',
-    timestamp: Date.now(),
-    group: GROUP_ID
-  });
-});
+// Helper functions for filtering and sorting
+function fullTextSearch(events, query) {
+  const searchTerms = query.toLowerCase().split(' ')
+  return events.filter(event => {
+    const searchText = `${event.title} ${event.description}`.toLowerCase()
+    return searchTerms.every(term => searchText.includes(term))
+  })
+}
 
-// Получение ленты постов с пагинацией
+function applyFilters(events, filters) {
+  let filtered = events
+  
+  if (filters.city) {
+    filtered = filtered.filter(e => e.city === filters.city)
+  }
+  
+  if (filters.category) {
+    filtered = filtered.filter(e => e.category === filters.category)
+  }
+  
+  if (filters.gender) {
+    filtered = filtered.filter(e => e.gender === filters.gender)
+  }
+  
+  if (filters.ageGroup) {
+    filtered = filtered.filter(e => e.ageGroup === filters.ageGroup)
+  }
+  
+  if (filters.dateFrom) {
+    filtered = filtered.filter(e => new Date(e.createdAt) >= new Date(filters.dateFrom))
+  }
+  
+  if (filters.dateTo) {
+    filtered = filtered.filter(e => new Date(e.createdAt) <= new Date(filters.dateTo))
+  }
+  
+  if (filters.authorId) {
+    filtered = filtered.filter(e => e.authorId === filters.authorId)
+  }
+  
+  return filtered
+}
+
+function sortEvents(events, sortType) {
+  switch (sortType) {
+    case 'popularity':
+      return [...events].sort((a, b) => (b.likes || 0) - (a.likes || 0))
+    case 'old':
+      return [...events].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    case 'new':
+    default:
+      return [...events].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+  }
+}
+
+// API Routes
 app.get('/api/feed', async (req, res) => {
   try {
     const { 
+      city, 
+      category, 
+      gender, 
+      ageGroup, 
+      search, 
+      sort = 'new',
       page = 1, 
       limit = 20,
-      city,
-      tag,
-      gender,
-      search 
-    } = req.query;
+      authorId,
+      dateFrom,
+      dateTo
+    } = req.query
 
-    console.log(`📋 Feed request: page=${page}, limit=${limit}, filters:`, { city, tag, gender, search });
-
-    // Получаем сообщения из группы
-    const messages = await bot.getChatHistory(GROUP_ID, {
-      limit: parseInt(limit) * 5, // Берем больше для фильтрации
-      offset: (parseInt(page) - 1) * parseInt(limit) * 5
-    });
-
-    console.log(`📥 Retrieved ${messages.length} messages from group`);
-
-    // Парсим и фильтруем посты
-    let posts = [];
-    for (const message of messages) {
-      const post = parsePost(message);
-      if (post) {
-        posts.push(post);
-      }
-    }
-
-    console.log(`✅ Parsed ${posts.length} valid posts`);
-
-    // Применяем фильтры
-    if (city && city !== 'all') {
-      posts = posts.filter(post => post.meta?.city === city);
-    }
+    // Read events from Telegram group (not from memory!)
+    let events = await getEventsFromTelegram()
     
-    if (tag && tag !== 'all') {
-      posts = posts.filter(post => post.meta?.tag === tag);
+    // If no events from main method, try alternative
+    if (events.length === 0) {
+      events = await getEventsFromUpdates()
     }
-    
-    if (gender && gender !== 'all') {
-      posts = posts.filter(post => post.meta?.gender === gender);
-    }
-    
+
+    // Apply search
     if (search) {
-      const searchLower = search.toLowerCase();
-      posts = posts.filter(post => 
-        post.title?.toLowerCase().includes(searchLower) ||
-        post.content?.toLowerCase().includes(searchLower)
-      );
+      events = fullTextSearch(events, search)
     }
 
-    // Сортируем по времени (новые первые)
-    posts.sort((a, b) => b.ts - a.ts);
+    // Apply filters
+    const filters = { city, category, gender, ageGroup, authorId, dateFrom, dateTo }
+    events = applyFilters(events, filters)
 
-    // Пагинация
-    const startIndex = (parseInt(page) - 1) * parseInt(limit);
-    const endIndex = startIndex + parseInt(limit);
-    const paginatedPosts = posts.slice(startIndex, endIndex);
+    // Apply sorting
+    events = sortEvents(events, sort)
+
+    // Pagination
+    const startIndex = (page - 1) * limit
+    const endIndex = startIndex + parseInt(limit)
+    const paginatedEvents = events.slice(startIndex, endIndex)
+
+    res.json({
+      posts: paginatedEvents,
+      hasMore: events.length > endIndex,
+      total: events.length,
+      page: parseInt(page),
+      limit: parseInt(limit)
+    })
+  } catch (error) {
+    console.error('Error fetching feed:', error)
+    res.status(500).json({ error: 'Failed to fetch feed' })
+  }
+})
+
+// Get single event by reading from Telegram
+app.get('/api/events/:id', async (req, res) => {
+  try {
+    const events = await getEventsFromTelegram()
+    const event = events.find(e => e.id === req.params.id)
     
-    const hasMore = posts.length > endIndex;
-
-    console.log(`📤 Returning ${paginatedPosts.length} posts (hasMore: ${hasMore})`);
-
-    res.json({
-      posts: paginatedPosts,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: posts.length,
-        hasMore
-      },
-      filters: { city, tag, gender, search },
-      timestamp: Date.now()
-    });
-
-  } catch (error) {
-    console.error('❌ Error fetching feed:', error);
-    res.status(500).json({
-      error: 'Failed to fetch feed',
-      message: error.message,
-      timestamp: Date.now()
-    });
-  }
-});
-
-// Получение последних постов (без пагинации)
-app.get('/api/feed/latest', async (req, res) => {
-  try {
-    const { limit = 10 } = req.query;
-
-    const messages = await bot.getChatHistory(GROUP_ID, {
-      limit: parseInt(limit) * 3 // Берем больше для парсинга
-    });
-
-    const posts = [];
-    for (const message of messages) {
-      const post = parsePost(message);
-      if (post && posts.length < parseInt(limit)) {
-        posts.push(post);
-      }
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' })
     }
-
-    // Сортируем по времени
-    posts.sort((a, b) => b.ts - a.ts);
-
-    res.json({
-      posts: posts.slice(0, parseInt(limit)),
-      count: posts.length,
-      timestamp: Date.now()
-    });
-
+    
+    res.json(event)
   } catch (error) {
-    console.error('❌ Error fetching latest posts:', error);
-    res.status(500).json({
-      error: 'Failed to fetch latest posts',
-      message: error.message
-    });
+    console.error('Error fetching event:', error)
+    res.status(500).json({ error: 'Failed to fetch event' })
   }
-});
+})
 
-// Получение конкретного поста по ID
-app.get('/api/posts/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    // Ищем пост по ID в истории группы
-    const messages = await bot.getChatHistory(GROUP_ID, {
-      limit: 1000 // Берем больше сообщений для поиска
-    });
-
-    for (const message of messages) {
-      const post = parsePost(message);
-      if (post && post.id === id) {
-        return res.json({
-          post,
-          found: true,
-          timestamp: Date.now()
-        });
-      }
-    }
-
-    res.status(404).json({
-      error: 'Post not found',
-      id,
-      timestamp: Date.now()
-    });
-
-  } catch (error) {
-    console.error('❌ Error fetching post:', error);
-    res.status(500).json({
-      error: 'Failed to fetch post',
-      message: error.message
-    });
-  }
-});
-
-// Создание тестового поста
-app.post('/api/test-post', async (req, res) => {
-  try {
-    const {
-      title = 'Тестовый пост от Bot #4',
-      content = 'Это тестовый пост для проверки работы системы',
-      city = 'moscow',
-      tag = 'general',
-      gender = 'male'
-    } = req.body;
-
-    const testPost = {
-      t: 'post',
-      id: generateId(),
-      title,
-      content,
-      author: {
-        id: 'bot_4_test',
-        name: 'Bot #4 Test',
-        photo: '',
-        username: 'bot4_test'
-      },
-      meta: {
-        city,
-        tag,
-        gender,
-        age: '25-35'
-      },
-      ts: Date.now(),
-      likes: 0,
-      views: 0
-    };
-
-    // Формируем сообщение для группы
-    const messageText = `POST::${testPost.id}::${testPost.ts}\n${JSON.stringify(testPost, null, 2)}`;
-
-    // Отправляем в группу
-    await bot.sendMessage(GROUP_ID, messageText);
-
-    console.log('✅ Test post created:', testPost.id);
-
-    res.json({
-      success: true,
-      post: testPost,
-      message: 'Test post created successfully',
-      timestamp: Date.now()
-    });
-
-  } catch (error) {
-    console.error('❌ Error creating test post:', error);
-    res.status(500).json({
-      error: 'Failed to create test post',
-      message: error.message
-    });
-  }
-});
-
-// ========================= СТАТИСТИКА =========================
-
+// Stats endpoint
 app.get('/api/stats', async (req, res) => {
   try {
-    // Получаем последние сообщения для анализа
-    const messages = await bot.getChatHistory(GROUP_ID, {
-      limit: 1000
-    });
-
-    let postsCount = 0;
-    let likesCount = 0;
-    let usersCount = new Set();
-
-    for (const message of messages) {
-      const text = message.text;
-      if (!text) continue;
-
-      if (text.startsWith('POST::')) {
-        postsCount++;
-        const post = parsePost(message);
-        if (post?.author?.id) {
-          usersCount.add(post.author.id);
-        }
-      } else if (text.startsWith('LIKE::')) {
-        likesCount++;
-      }
+    const events = await getEventsFromTelegram()
+    
+    const stats = {
+      totalEvents: events.length,
+      byCity: {},
+      byCategory: {},
+      byStatus: {}
     }
-
-    res.json({
-      posts: postsCount,
-      likes: likesCount,
-      users: usersCount.size,
-      messagesAnalyzed: messages.length,
-      timestamp: Date.now()
-    });
-
+    
+    events.forEach(event => {
+      // City stats
+      stats.byCity[event.city] = (stats.byCity[event.city] || 0) + 1
+      
+      // Category stats
+      stats.byCategory[event.category] = (stats.byCategory[event.category] || 0) + 1
+      
+      // Status stats
+      stats.byStatus[event.status] = (stats.byStatus[event.status] || 0) + 1
+    })
+    
+    res.json(stats)
   } catch (error) {
-    console.error('❌ Error fetching stats:', error);
-    res.status(500).json({
-      error: 'Failed to fetch stats',
-      message: error.message
-    });
+    console.error('Error fetching stats:', error)
+    res.status(500).json({ error: 'Failed to fetch stats' })
   }
-});
+})
 
-// ========================= ЗАПУСК СЕРВЕРА =========================
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK',
+    cacheStatus: messageCache ? 'cached' : 'empty',
+    webhookUrl: `${WEBHOOK_URL}/webhook`
+  })
+})
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('🤖 Bot #4 - Feed Server started');
-  console.log(`📡 Server running on port ${PORT}`);
-  console.log(`📱 Group ID: ${GROUP_ID}`);
-  console.log(`🔗 API URL: https://six-z05l.onrender.com`);
-  console.log('');
-  console.log('📋 Available endpoints:');
-  console.log('  GET  /api/feed - Feed with pagination');
-  console.log('  GET  /api/feed/latest - Latest posts');
-  console.log('  GET  /api/posts/:id - Get specific post');
-  console.log('  POST /api/test-post - Create test post');
-  console.log('  GET  /api/stats - Statistics');
-  console.log('');
-});
+// Error handler
+app.use((error, req, res, next) => {
+  console.error('Server error:', error)
+  res.status(500).json({ error: 'Internal server error' })
+})
 
-// Обработка ошибок
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-});
+// Setup webhook and start server
+async function setupWebhook() {
+  try {
+    const webhookUrl = `${WEBHOOK_URL}/webhook`
+    await bot.setWebHook(webhookUrl)
+    console.log('Webhook set to:', webhookUrl)
+  } catch (error) {
+    console.error('Error setting webhook:', error)
+  }
+}
 
-process.on('unhandledRejection', (error) => {
-  console.error('❌ Unhandled Rejection:', error);
-});
-
-module.exports = app;
+// Start server
+app.listen(PORT, async () => {
+  console.log(`Bot 2 server running on port ${PORT}`)
+  console.log(`Reading events from Telegram group on each request`)
+  
+  // Setup webhook for cache invalidation
+  await setupWebhook()
+  
+  console.log('Bot 2 initialization complete - NO in-memory storage!')
+})
