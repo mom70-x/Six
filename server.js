@@ -1,6 +1,8 @@
 const express = require('express')
 const TelegramBot = require('node-telegram-bot-api')
 const cors = require('cors')
+const fs = require('fs').promises
+const path = require('path')
 
 const app = express()
 
@@ -18,14 +20,48 @@ app.use(cors())
 app.use('/webhook', express.raw({ type: 'application/json' }))
 app.use(express.json())
 
-// Lightweight cache for recent messages (only for current request)
-let messageCache = null
-let cacheTimestamp = 0
-const CACHE_DURATION = 30000 // 30 seconds
+// In-memory storage (простое накопление)
+let events = []
+let lastProcessedMessageId = 0
+
+// Persistent storage file path
+const EVENTS_FILE = path.join(__dirname, 'events.json')
+
+// Load events from file on startup
+async function loadEventsFromFile() {
+  try {
+    const data = await fs.readFile(EVENTS_FILE, 'utf8')
+    const savedData = JSON.parse(data)
+    events = savedData.events || []
+    lastProcessedMessageId = savedData.lastProcessedMessageId || 0
+    console.log(`📁 Loaded ${events.length} events from file`)
+  } catch (error) {
+    console.log('📁 No existing events file, starting fresh')
+    events = []
+    lastProcessedMessageId = 0
+  }
+}
+
+// Save events to file
+async function saveEventsToFile() {
+  try {
+    const data = {
+      events,
+      lastProcessedMessageId,
+      updatedAt: new Date().toISOString()
+    }
+    await fs.writeFile(EVENTS_FILE, JSON.stringify(data, null, 2))
+    console.log(`💾 Saved ${events.length} events to file`)
+  } catch (error) {
+    console.error('💾 Error saving events to file:', error)
+  }
+}
 
 // Message parsers
 function parseEventFromMessage(text, messageId, date, from) {
   try {
+    console.log(`🔍 Parsing message ${messageId}:`, text.substring(0, 100) + '...')
+    
     // Parse create/update message: "🎯 Title\n\nDescription\n\n📍 city..."
     if (text.includes('🎯')) {
       const isUpdate = text.startsWith('✏️ Updated:')
@@ -97,79 +133,89 @@ function parseEventFromMessage(text, messageId, date, from) {
         telegramMessageId: messageId
       }
       
-      return event
+      console.log(`✅ Parsed event: ${title}`)
+      return { type: isUpdate ? 'update' : 'create', event }
     }
     
-    return null
-  } catch (error) {
-    console.error('Error parsing message:', error)
-    return null
-  }
-}
-
-// Read messages from Telegram group
-async function getEventsFromTelegram() {
-  try {
-    // Check cache first
-    if (messageCache && (Date.now() - cacheTimestamp < CACHE_DURATION)) {
-      return messageCache
-    }
-    
-    console.log('Reading messages from Telegram group...')
-    
-    // Get chat history - this works for supergroups
-    const messages = []
-    let offset = 0
-    const limit = 100 // Max messages per request
-    const maxMessages = 500 // Don't load too many on free plan
-    
-    // Note: In production you might need to use different approach
-    // as getUpdates has limitations for groups
-    
-    // Alternative: Read messages using chat export or admin bot
-    // For now, we'll simulate reading recent messages
-    
-    const events = []
-    
-    // Temporary cache to avoid repeated API calls
-    messageCache = events
-    cacheTimestamp = Date.now()
-    
-    return events
-  } catch (error) {
-    console.error('Error reading from Telegram:', error)
-    return []
-  }
-}
-
-// Alternative: Read messages using getUpdates (limited)
-async function getEventsFromUpdates() {
-  try {
-    const updates = await bot.getUpdates({ limit: 100, timeout: 10 })
-    const events = []
-    
-    updates.forEach(update => {
-      if (update.message && 
-          update.message.chat.id.toString() === GROUP_ID &&
-          update.message.text &&
-          update.message.text.includes('🎯')) {
-        
-        const { message_id, text, date, from } = update.message
-        const event = parseEventFromMessage(text, message_id, date, from)
-        if (event) {
-          events.push(event)
-        }
+    // Parse delete message: "🗑️ Event deleted\n\nEvent ID: {id}"
+    if (text.includes('🗑️') && text.includes('Event deleted')) {
+      const match = text.match(/Event ID:\s*(\w+)/)
+      if (match) {
+        console.log(`✅ Parsed delete: ${match[1]}`)
+        return { type: 'delete', eventId: match[1] }
       }
-    })
+    }
     
-    return events
+    // Parse like message: "⚡ Event liked/unliked\n\nEvent ID: {id}"
+    if (text.includes('⚡') && text.includes('Event ID:')) {
+      const match = text.match(/Event ID:\s*(\w+)/)
+      const isLiked = text.includes('liked') && !text.includes('unliked')
+      if (match) {
+        console.log(`✅ Parsed like: ${match[1]} - ${isLiked}`)
+        return { type: 'like', eventId: match[1], isLiked }
+      }
+    }
+    
+    return null
   } catch (error) {
-    console.error('Error getting updates:', error)
-    return []
+    console.error('💥 Error parsing message:', error)
+    return null
   }
 }
 
-// Webhook endpoint (for cache invalidation)
+// Process parsed message
+function processMessage(parsed) {
+  if (!parsed) return
+  
+  switch (parsed.type) {
+    case 'create':
+      // Check if event already exists
+      const existingIndex = events.findIndex(e => e.id === parsed.event.id)
+      if (existingIndex === -1) {
+        events.unshift(parsed.event) // Add to beginning for newest first
+        console.log(`📝 Event created: ${parsed.event.title}`)
+      } else {
+        console.log(`⚠️ Event already exists: ${parsed.event.title}`)
+      }
+      break
+      
+    case 'update':
+      const updateIndex = events.findIndex(e => e.id === parsed.event.id)
+      if (updateIndex !== -1) {
+        events[updateIndex] = { ...events[updateIndex], ...parsed.event }
+        console.log(`📝 Event updated: ${parsed.event.title}`)
+      } else {
+        // If event not found, create it
+        events.unshift(parsed.event)
+        console.log(`📝 Event created from update: ${parsed.event.title}`)
+      }
+      break
+      
+    case 'delete':
+      const deleteIndex = events.findIndex(e => e.id === parsed.eventId)
+      if (deleteIndex !== -1) {
+        const deletedEvent = events[deleteIndex]
+        events.splice(deleteIndex, 1)
+        console.log(`🗑️ Event deleted: ${parsed.eventId}`)
+      }
+      break
+      
+    case 'like':
+      const likeIndex = events.findIndex(e => e.id === parsed.eventId)
+      if (likeIndex !== -1) {
+        const event = events[likeIndex]
+        event.likes = parsed.isLiked ? event.likes + 1 : Math.max(0, event.likes - 1)
+        event.isLiked = parsed.isLiked
+        console.log(`⚡ Event liked: ${parsed.eventId} - ${parsed.isLiked}`)
+      }
+      break
+  }
+  
+  // Save to file after each change
+  saveEventsToFile().catch(console.error)
+}
+
+// Webhook endpoint
 app.post('/webhook', (req, res) => {
   try {
     const update = JSON.parse(req.body.toString())
@@ -177,18 +223,22 @@ app.post('/webhook', (req, res) => {
     // Process only messages from the specific group
     if (update.message && 
         update.message.chat.id.toString() === GROUP_ID &&
-        update.message.text) {
+        update.message.text &&
+        update.message.message_id > lastProcessedMessageId) {
       
-      console.log('New message in group, invalidating cache')
+      const { message_id, text, date, from } = update.message
+      console.log(`📨 New message ${message_id}: ${text.substring(0, 50)}...`)
       
-      // Invalidate cache when new message arrives
-      messageCache = null
-      cacheTimestamp = 0
+      const parsed = parseEventFromMessage(text, message_id, date, from)
+      processMessage(parsed)
+      
+      // Update last processed message ID
+      lastProcessedMessageId = message_id
     }
     
     res.status(200).send('OK')
   } catch (error) {
-    console.error('Webhook error:', error)
+    console.error('💥 Webhook error:', error)
     res.status(500).send('Error')
   }
 })
@@ -265,103 +315,113 @@ app.get('/api/feed', async (req, res) => {
       dateTo
     } = req.query
 
-    // Read events from Telegram group (not from memory!)
-    let events = await getEventsFromTelegram()
-    
-    // If no events from main method, try alternative
-    if (events.length === 0) {
-      events = await getEventsFromUpdates()
-    }
+    console.log(`📋 Feed request: ${events.length} total events, page ${page}`)
+
+    let filteredEvents = [...events] // Copy array
 
     // Apply search
     if (search) {
-      events = fullTextSearch(events, search)
+      filteredEvents = fullTextSearch(filteredEvents, search)
+      console.log(`🔍 After search: ${filteredEvents.length} events`)
     }
 
     // Apply filters
     const filters = { city, category, gender, ageGroup, authorId, dateFrom, dateTo }
-    events = applyFilters(events, filters)
+    filteredEvents = applyFilters(filteredEvents, filters)
+    console.log(`🔧 After filters: ${filteredEvents.length} events`)
 
     // Apply sorting
-    events = sortEvents(events, sort)
+    filteredEvents = sortEvents(filteredEvents, sort)
 
     // Pagination
     const startIndex = (page - 1) * limit
     const endIndex = startIndex + parseInt(limit)
-    const paginatedEvents = events.slice(startIndex, endIndex)
+    const paginatedEvents = filteredEvents.slice(startIndex, endIndex)
+
+    console.log(`📄 Returning ${paginatedEvents.length} events (${startIndex}-${endIndex})`)
 
     res.json({
       posts: paginatedEvents,
-      hasMore: events.length > endIndex,
-      total: events.length,
+      hasMore: filteredEvents.length > endIndex,
+      total: filteredEvents.length,
       page: parseInt(page),
       limit: parseInt(limit)
     })
   } catch (error) {
-    console.error('Error fetching feed:', error)
+    console.error('💥 Error fetching feed:', error)
     res.status(500).json({ error: 'Failed to fetch feed' })
   }
 })
 
-// Get single event by reading from Telegram
-app.get('/api/events/:id', async (req, res) => {
-  try {
-    const events = await getEventsFromTelegram()
-    const event = events.find(e => e.id === req.params.id)
-    
-    if (!event) {
-      return res.status(404).json({ error: 'Event not found' })
-    }
-    
-    res.json(event)
-  } catch (error) {
-    console.error('Error fetching event:', error)
-    res.status(500).json({ error: 'Failed to fetch event' })
+// Get single event
+app.get('/api/events/:id', (req, res) => {
+  const event = events.find(e => e.id === req.params.id)
+  if (!event) {
+    return res.status(404).json({ error: 'Event not found' })
   }
+  res.json(event)
 })
 
 // Stats endpoint
-app.get('/api/stats', async (req, res) => {
-  try {
-    const events = await getEventsFromTelegram()
-    
-    const stats = {
-      totalEvents: events.length,
-      byCity: {},
-      byCategory: {},
-      byStatus: {}
-    }
-    
-    events.forEach(event => {
-      // City stats
-      stats.byCity[event.city] = (stats.byCity[event.city] || 0) + 1
-      
-      // Category stats
-      stats.byCategory[event.category] = (stats.byCategory[event.category] || 0) + 1
-      
-      // Status stats
-      stats.byStatus[event.status] = (stats.byStatus[event.status] || 0) + 1
-    })
-    
-    res.json(stats)
-  } catch (error) {
-    console.error('Error fetching stats:', error)
-    res.status(500).json({ error: 'Failed to fetch stats' })
+app.get('/api/stats', (req, res) => {
+  const stats = {
+    totalEvents: events.length,
+    lastProcessedMessageId,
+    byCity: {},
+    byCategory: {},
+    byStatus: {}
   }
+  
+  events.forEach(event => {
+    // City stats
+    stats.byCity[event.city] = (stats.byCity[event.city] || 0) + 1
+    
+    // Category stats
+    stats.byCategory[event.category] = (stats.byCategory[event.category] || 0) + 1
+    
+    // Status stats
+    stats.byStatus[event.status] = (stats.byStatus[event.status] || 0) + 1
+  })
+  
+  res.json(stats)
+})
+
+// Debug endpoint to see all events
+app.get('/api/debug/events', (req, res) => {
+  res.json({
+    events: events.slice(0, 10), // Only first 10 for debugging
+    totalCount: events.length,
+    lastProcessedMessageId
+  })
+})
+
+// Manual trigger to process existing messages (for testing)
+app.post('/api/debug/process-message', (req, res) => {
+  const { text, messageId = Date.now(), date = Date.now() / 1000 } = req.body
+  
+  const parsed = parseEventFromMessage(text, messageId, date, null)
+  processMessage(parsed)
+  
+  res.json({
+    success: true,
+    parsed,
+    totalEvents: events.length
+  })
 })
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK',
-    cacheStatus: messageCache ? 'cached' : 'empty',
+    eventsCount: events.length,
+    lastProcessedMessageId,
     webhookUrl: `${WEBHOOK_URL}/webhook`
   })
 })
 
 // Error handler
 app.use((error, req, res, next) => {
-  console.error('Server error:', error)
+  console.error('💥 Server error:', error)
   res.status(500).json({ error: 'Internal server error' })
 })
 
@@ -370,19 +430,27 @@ async function setupWebhook() {
   try {
     const webhookUrl = `${WEBHOOK_URL}/webhook`
     await bot.setWebHook(webhookUrl)
-    console.log('Webhook set to:', webhookUrl)
+    console.log(`🔗 Webhook set to: ${webhookUrl}`)
   } catch (error) {
-    console.error('Error setting webhook:', error)
+    console.error('💥 Error setting webhook:', error)
   }
 }
 
 // Start server
 app.listen(PORT, async () => {
-  console.log(`Bot 2 server running on port ${PORT}`)
-  console.log(`Reading events from Telegram group on each request`)
+  console.log(`🚀 Bot 2 server running on port ${PORT}`)
   
-  // Setup webhook for cache invalidation
+  // Load existing events from file
+  await loadEventsFromFile()
+  
+  // Setup webhook
   await setupWebhook()
   
-  console.log('Bot 2 initialization complete - NO in-memory storage!')
+  console.log(`📡 Bot 2 ready - will accumulate messages from webhook`)
+  console.log(`📊 Current state: ${events.length} events, last message ID: ${lastProcessedMessageId}`)
+  
+  // Save events every 5 minutes
+  setInterval(() => {
+    saveEventsToFile().catch(console.error)
+  }, 5 * 60 * 1000)
 })
