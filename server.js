@@ -1,456 +1,757 @@
 const express = require('express')
+const http = require('http')
+const WebSocket = require('ws')
 const TelegramBot = require('node-telegram-bot-api')
 const cors = require('cors')
-const fs = require('fs').promises
-const path = require('path')
 
 const app = express()
+const server = http.createServer(app)
+const wss = new WebSocket.Server({ server })
 
 // Environment variables
-const BOT_TOKEN = '7948285859:AAGPM2BYYE2US3AIbP7P4yEBV4C5oWt3FSw'
+const BOT2_TOKEN = '7948285859:AAGPM2BYYE2US3AIbP7P4yEBV4C5oWt3FSw'
 const GROUP_ID = '-1002268255207'
+const BOT1_URL = 'https://sub-muey.onrender.com'
 const PORT = process.env.PORT || 3002
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://six-z05l.onrender.com'
 
 // Initialize Telegram bot
-const bot = new TelegramBot(BOT_TOKEN)
+const bot = new TelegramBot(BOT2_TOKEN, { polling: true })
 
 // Middleware
 app.use(cors())
-app.use('/webhook', express.raw({ type: 'application/json' }))
 app.use(express.json())
 
-// In-memory storage (простое накопление)
-let events = []
-let lastProcessedMessageId = 0
+// WebSocket clients
+const clients = new Set()
 
-// Persistent storage file path
-const EVENTS_FILE = path.join(__dirname, 'events.json')
+// ===== IN-MEMORY EVENT CACHE =====
+let eventsCache = []
+let lastSyncTime = 0
+const CACHE_DURATION = 5 * 60 * 1000 // 5 минут
 
-// Load events from file on startup
-async function loadEventsFromFile() {
+// ===== TELEGRAM MESSAGE PARSING =====
+function parseEventFromMessage(msg) {
   try {
-    const data = await fs.readFile(EVENTS_FILE, 'utf8')
-    const savedData = JSON.parse(data)
-    events = savedData.events || []
-    lastProcessedMessageId = savedData.lastProcessedMessageId || 0
-    console.log(`📁 Loaded ${events.length} events from file`)
+    if (!msg.text || !msg.text.includes('🎯')) return null
+    
+    const text = msg.text
+    
+    // Парсим основные данные
+    const titleMatch = text.match(/🎯 <b>(.*?)<\/b>/)
+    const descMatch = text.match(/<\/b>\n\n(.*?)\n\n/)
+    
+    // Парсим метаданные
+    const cityMatch = text.match(/📍 ([^|]+)/)
+    const categoryMatch = text.match(/🏷️ ([^|]+)/)
+    const genderMatch = text.match(/👤 ([^|]+)/)
+    const ageMatch = text.match(/🎂 ([^|]+)/)
+    
+    // Парсим автора
+    const authorMatch = text.match(/👤 ([^(@\n]+)/)
+    const usernameMatch = text.match(/@([^\s\n]+)/)
+    
+    // Парсим ID и лайки
+    const idMatch = text.match(/#([a-zA-Z0-9-]+)/)
+    const likesMatch = text.match(/⚡ (\d+)/)
+    
+    // Парсим контакты
+    const contactsSection = text.match(/📞 Контакты:\n(.*?)(?=\n\n|$)/s)
+    let contacts = []
+    if (contactsSection) {
+      contacts = contactsSection[1]
+        .split('\n')
+        .map(line => line.replace('• ', '').trim())
+        .filter(Boolean)
+    }
+    
+    if (!titleMatch || !descMatch || !idMatch) return null
+    
+    return {
+      id: idMatch[1],
+      title: titleMatch[1],
+      description: descMatch[1],
+      authorId: `tg_${msg.from?.id || 'unknown'}`,
+      author: {
+        fullName: authorMatch ? authorMatch[1].trim() : 'Unknown',
+        username: usernameMatch ? usernameMatch[1] : null,
+        telegramId: msg.from?.id?.toString(),
+        avatar: null
+      },
+      city: cityMatch ? cityMatch[1].trim() : '',
+      category: categoryMatch ? categoryMatch[1].trim() : '',
+      gender: genderMatch ? genderMatch[1].trim() : '',
+      ageGroup: ageMatch ? ageMatch[1].trim() : '',
+      likes: likesMatch ? parseInt(likesMatch[1]) : 0,
+      isLiked: false,
+      contacts: contacts,
+      status: 'active',
+      createdAt: new Date(msg.date * 1000).toISOString(),
+      updatedAt: new Date(msg.date * 1000).toISOString(),
+      date: new Date(msg.date * 1000).toISOString(),
+      telegramMessageId: msg.message_id
+    }
   } catch (error) {
-    console.log('📁 No existing events file, starting fresh')
-    events = []
-    lastProcessedMessageId = 0
-  }
-}
-
-// Save events to file
-async function saveEventsToFile() {
-  try {
-    const data = {
-      events,
-      lastProcessedMessageId,
-      updatedAt: new Date().toISOString()
-    }
-    await fs.writeFile(EVENTS_FILE, JSON.stringify(data, null, 2))
-    console.log(`💾 Saved ${events.length} events to file`)
-  } catch (error) {
-    console.error('💾 Error saving events to file:', error)
-  }
-}
-
-// Message parsers
-function parseEventFromMessage(text, messageId, date, from) {
-  try {
-    console.log(`🔍 Parsing message ${messageId}:`, text.substring(0, 100) + '...')
-    
-    // Parse create/update message: "🎯 Title\n\nDescription\n\n📍 city..."
-    if (text.includes('🎯')) {
-      const isUpdate = text.startsWith('✏️ Updated:')
-      const content = isUpdate ? text.replace('✏️ Updated:\n\n', '') : text
-      
-      const lines = content.split('\n').filter(line => line.trim())
-      
-      // Extract title (after 🎯)
-      const titleLine = lines.find(line => line.includes('🎯'))
-      if (!titleLine) return null
-      
-      const title = titleLine.replace('🎯', '').replace(/<\/?b>/g, '').trim()
-      
-      // Extract description (lines between title and metadata)
-      const titleIndex = lines.findIndex(line => line.includes('🎯'))
-      let description = ''
-      let metadataStartIndex = lines.length
-      
-      for (let i = titleIndex + 1; i < lines.length; i++) {
-        if (lines[i].match(/^[📍🏷️👤🎂]/)) {
-          metadataStartIndex = i
-          break
-        }
-        if (lines[i].trim()) {
-          description += (description ? ' ' : '') + lines[i].trim()
-        }
-      }
-      
-      // Extract metadata
-      const metadata = lines.slice(metadataStartIndex)
-      let city = '', category = '', gender = '', ageGroup = '', authorName = '', username = ''
-      
-      metadata.forEach(line => {
-        if (line.startsWith('📍')) city = line.replace('📍', '').trim()
-        else if (line.startsWith('🏷️')) category = line.replace('🏷️', '').trim()
-        else if (line.startsWith('👤') && !line.includes('@')) gender = line.replace('👤', '').trim()
-        else if (line.startsWith('🎂')) ageGroup = line.replace('🎂', '').trim()
-        else if (line.startsWith('👤') && line.includes('@')) {
-          const authorLine = line.replace('👤', '').trim()
-          const match = authorLine.match(/^(.+?)\s*\(@(.+?)\)$/)
-          if (match) {
-            authorName = match[1].trim()
-            username = match[2].trim()
-          } else {
-            authorName = authorLine
-          }
-        }
-      })
-      
-      const event = {
-        id: messageId.toString(),
-        title,
-        description,
-        authorId: from?.id?.toString() || 'unknown',
-        author: {
-          fullName: authorName,
-          username: username || undefined,
-          telegramId: from?.id?.toString()
-        },
-        city,
-        category,
-        gender,
-        ageGroup,
-        createdAt: new Date(date * 1000).toISOString(),
-        updatedAt: new Date().toISOString(),
-        likes: 0,
-        isLiked: false,
-        status: 'active',
-        telegramMessageId: messageId
-      }
-      
-      console.log(`✅ Parsed event: ${title}`)
-      return { type: isUpdate ? 'update' : 'create', event }
-    }
-    
-    // Parse delete message: "🗑️ Event deleted\n\nEvent ID: {id}"
-    if (text.includes('🗑️') && text.includes('Event deleted')) {
-      const match = text.match(/Event ID:\s*(\w+)/)
-      if (match) {
-        console.log(`✅ Parsed delete: ${match[1]}`)
-        return { type: 'delete', eventId: match[1] }
-      }
-    }
-    
-    // Parse like message: "⚡ Event liked/unliked\n\nEvent ID: {id}"
-    if (text.includes('⚡') && text.includes('Event ID:')) {
-      const match = text.match(/Event ID:\s*(\w+)/)
-      const isLiked = text.includes('liked') && !text.includes('unliked')
-      if (match) {
-        console.log(`✅ Parsed like: ${match[1]} - ${isLiked}`)
-        return { type: 'like', eventId: match[1], isLiked }
-      }
-    }
-    
-    return null
-  } catch (error) {
-    console.error('💥 Error parsing message:', error)
+    console.error('Parse error:', error)
     return null
   }
 }
 
-// Process parsed message
-function processMessage(parsed) {
-  if (!parsed) return
-  
-  switch (parsed.type) {
-    case 'create':
-      // Check if event already exists
-      const existingIndex = events.findIndex(e => e.id === parsed.event.id)
-      if (existingIndex === -1) {
-        events.unshift(parsed.event) // Add to beginning for newest first
-        console.log(`📝 Event created: ${parsed.event.title}`)
-      } else {
-        console.log(`⚠️ Event already exists: ${parsed.event.title}`)
-      }
-      break
-      
-    case 'update':
-      const updateIndex = events.findIndex(e => e.id === parsed.event.id)
-      if (updateIndex !== -1) {
-        events[updateIndex] = { ...events[updateIndex], ...parsed.event }
-        console.log(`📝 Event updated: ${parsed.event.title}`)
-      } else {
-        // If event not found, create it
-        events.unshift(parsed.event)
-        console.log(`📝 Event created from update: ${parsed.event.title}`)
-      }
-      break
-      
-    case 'delete':
-      const deleteIndex = events.findIndex(e => e.id === parsed.eventId)
-      if (deleteIndex !== -1) {
-        const deletedEvent = events[deleteIndex]
-        events.splice(deleteIndex, 1)
-        console.log(`🗑️ Event deleted: ${parsed.eventId}`)
-      }
-      break
-      
-    case 'like':
-      const likeIndex = events.findIndex(e => e.id === parsed.eventId)
-      if (likeIndex !== -1) {
-        const event = events[likeIndex]
-        event.likes = parsed.isLiked ? event.likes + 1 : Math.max(0, event.likes - 1)
-        event.isLiked = parsed.isLiked
-        console.log(`⚡ Event liked: ${parsed.eventId} - ${parsed.isLiked}`)
-      }
-      break
-  }
-  
-  // Save to file after each change
-  saveEventsToFile().catch(console.error)
-}
-
-// Webhook endpoint
-app.post('/webhook', (req, res) => {
+// ===== TELEGRAM GROUP READER =====
+async function syncEventsFromTelegram() {
   try {
-    const update = JSON.parse(req.body.toString())
+    console.log('📖 Syncing events from Telegram group...')
     
-    // Process only messages from the specific group
-    if (update.message && 
-        update.message.chat.id.toString() === GROUP_ID &&
-        update.message.text &&
-        update.message.message_id > lastProcessedMessageId) {
-      
-      const { message_id, text, date, from } = update.message
-      console.log(`📨 New message ${message_id}: ${text.substring(0, 50)}...`)
-      
-      const parsed = parseEventFromMessage(text, message_id, date, from)
-      processMessage(parsed)
-      
-      // Update last processed message ID
-      lastProcessedMessageId = message_id
+    const updates = await bot.getUpdates({ 
+      limit: 100,
+      allowed_updates: ['message'] 
+    })
+    
+    const events = []
+    
+    for (const update of updates) {
+      if (update.message && 
+          update.message.chat.id.toString() === GROUP_ID &&
+          update.message.text?.includes('🎯')) {
+        
+        const event = parseEventFromMessage(update.message)
+        if (event) {
+          events.push(event)
+        }
+      }
     }
     
-    res.status(200).send('OK')
+    // Удаляем дубликаты по ID
+    const uniqueEvents = []
+    const seenIds = new Set()
+    
+    for (const event of events.reverse()) { // Новые сначала
+      if (!seenIds.has(event.id)) {
+        seenIds.add(event.id)
+        uniqueEvents.push(event)
+      }
+    }
+    
+    eventsCache = uniqueEvents
+    lastSyncTime = Date.now()
+    
+    console.log(`✅ Synced ${eventsCache.length} events from Telegram`)
+    return eventsCache
+    
   } catch (error) {
-    console.error('💥 Webhook error:', error)
-    res.status(500).send('Error')
+    console.error('❌ Sync error:', error)
+    return eventsCache
   }
-})
-
-// Helper functions for filtering and sorting
-function fullTextSearch(events, query) {
-  const searchTerms = query.toLowerCase().split(' ')
-  return events.filter(event => {
-    const searchText = `${event.title} ${event.description}`.toLowerCase()
-    return searchTerms.every(term => searchText.includes(term))
-  })
 }
 
-function applyFilters(events, filters) {
-  let filtered = events
+// ===== EVENT FILTERING & SEARCHING =====
+function filterEvents(events, filters = {}) {
+  let filtered = [...events]
   
+  // Search
+  if (filters.search) {
+    const search = filters.search.toLowerCase()
+    filtered = filtered.filter(event => 
+      event.title.toLowerCase().includes(search) ||
+      event.description.toLowerCase().includes(search)
+    )
+  }
+  
+  // City filter
   if (filters.city) {
-    filtered = filtered.filter(e => e.city === filters.city)
+    filtered = filtered.filter(event => event.city === filters.city)
   }
   
+  // Category filter
   if (filters.category) {
-    filtered = filtered.filter(e => e.category === filters.category)
+    filtered = filtered.filter(event => event.category === filters.category)
   }
   
+  // Gender filter
   if (filters.gender) {
-    filtered = filtered.filter(e => e.gender === filters.gender)
+    filtered = filtered.filter(event => event.gender === filters.gender)
   }
   
+  // Age group filter
   if (filters.ageGroup) {
-    filtered = filtered.filter(e => e.ageGroup === filters.ageGroup)
+    filtered = filtered.filter(event => event.ageGroup === filters.ageGroup)
   }
   
+  // Author filter
+  if (filters.authorId) {
+    filtered = filtered.filter(event => event.authorId === filters.authorId)
+  }
+  
+  // Date filters
   if (filters.dateFrom) {
-    filtered = filtered.filter(e => new Date(e.createdAt) >= new Date(filters.dateFrom))
+    const fromDate = new Date(filters.dateFrom)
+    filtered = filtered.filter(event => new Date(event.createdAt) >= fromDate)
   }
   
   if (filters.dateTo) {
-    filtered = filtered.filter(e => new Date(e.createdAt) <= new Date(filters.dateTo))
+    const toDate = new Date(filters.dateTo)
+    filtered = filtered.filter(event => new Date(event.createdAt) <= toDate)
   }
   
-  if (filters.authorId) {
-    filtered = filtered.filter(e => e.authorId === filters.authorId)
+  // Sorting
+  if (filters.sort === 'popularity') {
+    filtered.sort((a, b) => b.likes - a.likes)
+  } else if (filters.sort === 'old') {
+    filtered.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+  } else {
+    // Default: newest first
+    filtered.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
   }
   
   return filtered
 }
 
-function sortEvents(events, sortType) {
-  switch (sortType) {
-    case 'popularity':
-      return [...events].sort((a, b) => (b.likes || 0) - (a.likes || 0))
-    case 'old':
-      return [...events].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
-    case 'new':
-    default:
-      return [...events].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+// ===== PAGINATION =====
+function paginateEvents(events, page = 1, limit = 20) {
+  const offset = (page - 1) * limit
+  const paginated = events.slice(offset, offset + limit)
+  const hasMore = offset + limit < events.length
+  
+  return {
+    events: paginated,
+    hasMore,
+    total: events.length,
+    page: parseInt(page),
+    limit: parseInt(limit)
   }
 }
 
-// API Routes
+// ===== HTTP API ENDPOINTS =====
+
+// Feed endpoint with search, filters, and pagination
 app.get('/api/feed', async (req, res) => {
   try {
-    const { 
-      city, 
-      category, 
-      gender, 
-      ageGroup, 
-      search, 
-      sort = 'new',
-      page = 1, 
-      limit = 20,
-      authorId,
-      dateFrom,
-      dateTo
+    // Check if cache needs refresh
+    if (Date.now() - lastSyncTime > CACHE_DURATION) {
+      await syncEventsFromTelegram()
+    }
+    
+    const {
+      search, city, category, gender, ageGroup, authorId,
+      dateFrom, dateTo, sort = 'new', page = 1, limit = 20
     } = req.query
 
-    console.log(`📋 Feed request: ${events.length} total events, page ${page}`)
-
-    let filteredEvents = [...events] // Copy array
-
-    // Apply search
-    if (search) {
-      filteredEvents = fullTextSearch(filteredEvents, search)
-      console.log(`🔍 After search: ${filteredEvents.length} events`)
+    const filters = {
+      search, city, category, gender, 
+      ageGroup, authorId, dateFrom, dateTo, sort
     }
 
-    // Apply filters
-    const filters = { city, category, gender, ageGroup, authorId, dateFrom, dateTo }
-    filteredEvents = applyFilters(filteredEvents, filters)
-    console.log(`🔧 After filters: ${filteredEvents.length} events`)
-
-    // Apply sorting
-    filteredEvents = sortEvents(filteredEvents, sort)
-
-    // Pagination
-    const startIndex = (page - 1) * limit
-    const endIndex = startIndex + parseInt(limit)
-    const paginatedEvents = filteredEvents.slice(startIndex, endIndex)
-
-    console.log(`📄 Returning ${paginatedEvents.length} events (${startIndex}-${endIndex})`)
+    const filteredEvents = filterEvents(eventsCache, filters)
+    const result = paginateEvents(filteredEvents, page, limit)
 
     res.json({
-      posts: paginatedEvents,
-      hasMore: filteredEvents.length > endIndex,
-      total: filteredEvents.length,
-      page: parseInt(page),
-      limit: parseInt(limit)
+      posts: result.events,
+      hasMore: result.hasMore,
+      total: result.total,
+      page: result.page,
+      limit: result.limit,
+      cacheTime: lastSyncTime
     })
+
+    console.log(`📋 Feed: ${result.events.length}/${result.total} events (page ${page})`)
+
   } catch (error) {
-    console.error('💥 Error fetching feed:', error)
+    console.error('Feed error:', error)
     res.status(500).json({ error: 'Failed to fetch feed' })
   }
 })
 
-// Get single event
-app.get('/api/events/:id', (req, res) => {
-  const event = events.find(e => e.id === req.params.id)
-  if (!event) {
-    return res.status(404).json({ error: 'Event not found' })
+// Force sync endpoint
+app.post('/api/sync', async (req, res) => {
+  try {
+    const events = await syncEventsFromTelegram()
+    
+    // Broadcast to all connected clients
+    broadcast('EVENTS_SYNCED', { 
+      count: events.length,
+      timestamp: Date.now() 
+    })
+    
+    res.json({
+      success: true,
+      eventsCount: events.length,
+      timestamp: lastSyncTime
+    })
+  } catch (error) {
+    res.status(500).json({ error: 'Sync failed' })
   }
-  res.json(event)
+})
+
+// Search endpoint (для команд из Telegram)
+app.get('/api/search', async (req, res) => {
+  try {
+    const { q, limit = 5 } = req.query
+    
+    if (!q) {
+      return res.json({ events: [] })
+    }
+    
+    const filtered = filterEvents(eventsCache, { search: q })
+    const result = paginateEvents(filtered, 1, limit)
+    
+    res.json({
+      events: result.events,
+      total: result.total
+    })
+  } catch (error) {
+    res.status(500).json({ error: 'Search failed' })
+  }
 })
 
 // Stats endpoint
 app.get('/api/stats', (req, res) => {
   const stats = {
-    totalEvents: events.length,
-    lastProcessedMessageId,
-    byCity: {},
+    totalEvents: eventsCache.length,
+    lastSync: lastSyncTime,
+    cacheAge: Date.now() - lastSyncTime,
+    connectedClients: clients.size,
+    
+    // Group by categories
     byCategory: {},
-    byStatus: {}
+    byCities: {},
+    byGender: {},
+    totalLikes: 0
   }
   
-  events.forEach(event => {
-    // City stats
-    stats.byCity[event.city] = (stats.byCity[event.city] || 0) + 1
+  eventsCache.forEach(event => {
+    // Categories
+    if (event.category) {
+      stats.byCategory[event.category] = (stats.byCategory[event.category] || 0) + 1
+    }
     
-    // Category stats
-    stats.byCategory[event.category] = (stats.byCategory[event.category] || 0) + 1
+    // Cities
+    if (event.city) {
+      stats.byCities[event.city] = (stats.byCities[event.city] || 0) + 1
+    }
     
-    // Status stats
-    stats.byStatus[event.status] = (stats.byStatus[event.status] || 0) + 1
+    // Gender
+    if (event.gender) {
+      stats.byGender[event.gender] = (stats.byGender[event.gender] || 0) + 1
+    }
+    
+    stats.totalLikes += event.likes
   })
   
   res.json(stats)
 })
 
-// Debug endpoint to see all events
-app.get('/api/debug/events', (req, res) => {
-  res.json({
-    events: events.slice(0, 10), // Only first 10 for debugging
-    totalCount: events.length,
-    lastProcessedMessageId
-  })
-})
-
-// Manual trigger to process existing messages (for testing)
-app.post('/api/debug/process-message', (req, res) => {
-  const { text, messageId = Date.now(), date = Date.now() / 1000 } = req.body
+// ===== WEBSOCKET MANAGEMENT =====
+wss.on('connection', (ws, req) => {
+  const clientId = Date.now().toString()
+  ws.clientId = clientId
+  clients.add(ws)
   
-  const parsed = parseEventFromMessage(text, messageId, date, null)
-  processMessage(parsed)
+  console.log(`🔗 Client connected: ${clientId} (${clients.size} total)`)
   
-  res.json({
-    success: true,
-    parsed,
-    totalEvents: events.length
+  ws.send(JSON.stringify({
+    type: 'CONNECTED',
+    data: { 
+      clientId, 
+      timestamp: Date.now(),
+      eventsCount: eventsCache.length 
+    }
+  }))
+
+  // Send initial data if cache is available
+  if (eventsCache.length > 0) {
+    ws.send(JSON.stringify({
+      type: 'INITIAL_EVENTS',
+      data: {
+        events: eventsCache.slice(0, 20), // First 20 events
+        total: eventsCache.length,
+        cacheTime: lastSyncTime
+      }
+    }))
+  }
+
+  ws.on('message', async (data) => {
+    try {
+      const message = JSON.parse(data.toString())
+      await handleWebSocketMessage(message, ws)
+    } catch (error) {
+      console.error(`💥 WS Error from ${clientId}:`, error)
+      ws.send(JSON.stringify({
+        type: 'ERROR',
+        data: { message: 'Failed to process message' }
+      }))
+    }
+  })
+
+  ws.on('close', () => {
+    clients.delete(ws)
+    console.log(`🔌 Client disconnected: ${clientId} (${clients.size} remaining)`)
+  })
+
+  ws.on('error', (error) => {
+    console.error(`💥 WS Error ${clientId}:`, error)
+    clients.delete(ws)
   })
 })
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK',
-    eventsCount: events.length,
-    lastProcessedMessageId,
-    webhookUrl: `${WEBHOOK_URL}/webhook`
+function broadcast(type, data, excludeClient = null) {
+  const message = JSON.stringify({ type, data })
+  let sent = 0
+  
+  clients.forEach((client) => {
+    if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message)
+        sent++
+      } catch (error) {
+        console.error(`Failed to send to client ${client.clientId}:`, error)
+        clients.delete(client)
+      }
+    }
   })
-})
+  
+  console.log(`📢 Broadcast ${type}: ${sent} clients`)
+}
 
-// Error handler
-app.use((error, req, res, next) => {
-  console.error('💥 Server error:', error)
-  res.status(500).json({ error: 'Internal server error' })
-})
+// ===== WEBSOCKET MESSAGE HANDLERS =====
+async function handleWebSocketMessage(message, senderWs) {
+  const { type, data } = message
 
-// Setup webhook and start server
-async function setupWebhook() {
   try {
-    const webhookUrl = `${WEBHOOK_URL}/webhook`
-    await bot.setWebHook(webhookUrl)
-    console.log(`🔗 Webhook set to: ${webhookUrl}`)
+    switch (type) {
+      case 'GET_FEED':
+        await handleGetFeed(data, senderWs)
+        break
+      case 'SEARCH_EVENTS':
+        await handleSearchEvents(data, senderWs)
+        break
+      case 'SYNC_REQUEST':
+        await handleSyncRequest(senderWs)
+        break
+      case 'PING':
+        senderWs.send(JSON.stringify({ type: 'PONG', data: { timestamp: Date.now() } }))
+        break
+      default:
+        senderWs.send(JSON.stringify({
+          type: 'ERROR',
+          data: { message: `Unknown message type: ${type}` }
+        }))
+    }
   } catch (error) {
-    console.error('💥 Error setting webhook:', error)
+    console.error('WebSocket handler error:', error)
+    senderWs.send(JSON.stringify({
+      type: `${type}_ERROR`,
+      data: { message: error.message }
+    }))
   }
 }
 
-// Start server
-app.listen(PORT, async () => {
-  console.log(`🚀 Bot 2 server running on port ${PORT}`)
+async function handleGetFeed(data, senderWs) {
+  const { filters = {}, page = 1, limit = 20 } = data
   
-  // Load existing events from file
-  await loadEventsFromFile()
+  // Refresh cache if needed
+  if (Date.now() - lastSyncTime > CACHE_DURATION) {
+    await syncEventsFromTelegram()
+  }
   
-  // Setup webhook
-  await setupWebhook()
+  const filteredEvents = filterEvents(eventsCache, filters)
+  const result = paginateEvents(filteredEvents, page, limit)
   
-  console.log(`📡 Bot 2 ready - will accumulate messages from webhook`)
-  console.log(`📊 Current state: ${events.length} events, last message ID: ${lastProcessedMessageId}`)
+  senderWs.send(JSON.stringify({
+    type: 'FEED_RESPONSE',
+    data: result
+  }))
+}
+
+async function handleSearchEvents(data, senderWs) {
+  const { query, limit = 20 } = data
   
-  // Save events every 5 minutes
-  setInterval(() => {
-    saveEventsToFile().catch(console.error)
-  }, 5 * 60 * 1000)
+  const filtered = filterEvents(eventsCache, { search: query })
+  const result = paginateEvents(filtered, 1, limit)
+  
+  senderWs.send(JSON.stringify({
+    type: 'SEARCH_RESPONSE',
+    data: result
+  }))
+}
+
+async function handleSyncRequest(senderWs) {
+  const events = await syncEventsFromTelegram()
+  
+  senderWs.send(JSON.stringify({
+    type: 'SYNC_RESPONSE',
+    data: {
+      eventsCount: events.length,
+      timestamp: lastSyncTime
+    }
+  }))
+}
+
+// ===== TELEGRAM BOT COMMANDS =====
+bot.on('message', async (msg) => {
+  try {
+    // Only process messages from our group
+    if (msg.chat.id.toString() !== GROUP_ID) return
+    
+    const text = msg.text
+    if (!text) return
+    
+    // Handle search commands
+    if (text.startsWith('/search ')) {
+      const query = text.replace('/search ', '').trim()
+      await handleTelegramSearch(msg, query)
+    }
+    
+    // Handle stats command
+    if (text === '/stats') {
+      await handleTelegramStats(msg)
+    }
+    
+    // Handle sync command
+    if (text === '/sync') {
+      await handleTelegramSync(msg)
+    }
+    
+    // Auto-sync when new events are posted
+    if (text.includes('🎯') && msg.from.id !== parseInt(BOT2_TOKEN.split(':')[0])) {
+      setTimeout(() => {
+        syncEventsFromTelegram()
+      }, 2000) // Delay to ensure message is processed
+    }
+    
+  } catch (error) {
+    console.error('Telegram message error:', error)
+  }
+})
+
+async function handleTelegramSearch(msg, query) {
+  try {
+    const filtered = filterEvents(eventsCache, { search: query })
+    const result = paginateEvents(filtered, 1, 5)
+    
+    if (result.events.length === 0) {
+      await bot.sendMessage(GROUP_ID, `🔍 По запросу "${query}" ничего не найдено`)
+      return
+    }
+    
+    let response = `🔍 Найдено ${result.total} событий по запросу "${query}":\n\n`
+    
+    result.events.forEach((event, index) => {
+      response += `${index + 1}. 🎯 <b>${event.title}</b>\n`
+      response += `${event.description.substring(0, 100)}${event.description.length > 100 ? '...' : ''}\n`
+      response += `⚡ ${event.likes} | 👤 ${event.author.fullName}\n\n`
+    })
+    
+    if (result.hasMore) {
+      response += `... и еще ${result.total - result.events.length} событий`
+    }
+    
+    await bot.sendMessage(GROUP_ID, response, { parse_mode: 'HTML' })
+    
+  } catch (error) {
+    console.error('Search error:', error)
+    await bot.sendMessage(GROUP_ID, '❌ Ошибка поиска')
+  }
+}
+
+async function handleTelegramStats(msg) {
+  try {
+    const stats = {
+      total: eventsCache.length,
+      totalLikes: eventsCache.reduce((sum, event) => sum + event.likes, 0),
+      byCategory: {},
+      byCities: {},
+      topLiked: eventsCache
+        .sort((a, b) => b.likes - a.likes)
+        .slice(0, 3)
+    }
+    
+    eventsCache.forEach(event => {
+      if (event.category) {
+        stats.byCategory[event.category] = (stats.byCategory[event.category] || 0) + 1
+      }
+      if (event.city) {
+        stats.byCities[event.city] = (stats.byCities[event.city] || 0) + 1
+      }
+    })
+    
+    let response = `📊 <b>Статистика группы:</b>\n\n`
+    response += `📝 Всего событий: ${stats.total}\n`
+    response += `⚡ Всего лайков: ${stats.totalLikes}\n`
+    response += `🔗 Подключено клиентов: ${clients.size}\n\n`
+    
+    if (Object.keys(stats.byCategory).length > 0) {
+      response += `🏷️ <b>По категориям:</b>\n`
+      Object.entries(stats.byCategory).forEach(([cat, count]) => {
+        response += `• ${cat}: ${count}\n`
+      })
+      response += '\n'
+    }
+    
+    if (Object.keys(stats.byCities).length > 0) {
+      response += `📍 <b>По городам:</b>\n`
+      Object.entries(stats.byCities).forEach(([city, count]) => {
+        response += `• ${city}: ${count}\n`
+      })
+      response += '\n'
+    }
+    
+    if (stats.topLiked.length > 0) {
+      response += `🔥 <b>Топ по лайкам:</b>\n`
+      stats.topLiked.forEach((event, index) => {
+        response += `${index + 1}. ${event.title} (⚡ ${event.likes})\n`
+      })
+    }
+    
+    await bot.sendMessage(GROUP_ID, response, { parse_mode: 'HTML' })
+    
+  } catch (error) {
+    console.error('Stats error:', error)
+    await bot.sendMessage(GROUP_ID, '❌ Ошибка получения статистики')
+  }
+}
+
+async function handleTelegramSync(msg) {
+  try {
+    const events = await syncEventsFromTelegram()
+    
+    broadcast('EVENTS_SYNCED', { 
+      count: events.length,
+      timestamp: Date.now() 
+    })
+    
+    await bot.sendMessage(GROUP_ID, 
+      `🔄 Синхронизация завершена\n📝 Загружено событий: ${events.length}\n🔗 Подключено клиентов: ${clients.size}`,
+      { parse_mode: 'HTML' }
+    )
+    
+  } catch (error) {
+    console.error('Sync error:', error)
+    await bot.sendMessage(GROUP_ID, '❌ Ошибка синхронизации')
+  }
+}
+
+// ===== WEBHOOK ENDPOINTS FOR BOT1 =====
+
+// Receive commands from BOT1
+app.post('/api/webhook/command', async (req, res) => {
+  try {
+    const { type, eventId, data } = req.body
+    
+    console.log(`📨 Webhook command: ${type} for event ${eventId}`)
+    
+    switch (type) {
+      case 'UPDATE_LIKES':
+        await handleLikeUpdate(eventId, data.likes)
+        break
+      case 'DELETE_EVENT':
+        await handleEventDelete(eventId)
+        break
+      case 'UPDATE_EVENT':
+        await handleEventUpdate(eventId, data)
+        break
+      default:
+        console.log(`Unknown webhook command: ${type}`)
+    }
+    
+    res.json({ success: true })
+    
+  } catch (error) {
+    console.error('Webhook error:', error)
+    res.status(500).json({ error: 'Webhook failed' })
+  }
+})
+
+async function handleLikeUpdate(eventId, newLikes) {
+  // Find event in cache and update likes
+  const eventIndex = eventsCache.findIndex(e => e.id === eventId)
+  if (eventIndex !== -1) {
+    eventsCache[eventIndex].likes = newLikes
+    
+    // Broadcast update to all clients
+    broadcast('EVENT_UPDATED', {
+      id: eventId,
+      likes: newLikes,
+      type: 'likes'
+    })
+  }
+}
+
+async function handleEventDelete(eventId) {
+  // Remove from cache
+  eventsCache = eventsCache.filter(e => e.id !== eventId)
+  
+  // Broadcast deletion to all clients
+  broadcast('EVENT_DELETED', { id: eventId })
+}
+
+async function handleEventUpdate(eventId, updates) {
+  // Update in cache
+  const eventIndex = eventsCache.findIndex(e => e.id === eventId)
+  if (eventIndex !== -1) {
+    eventsCache[eventIndex] = { ...eventsCache[eventIndex], ...updates }
+    
+    // Broadcast update to all clients
+    broadcast('EVENT_UPDATED', {
+      id: eventId,
+      ...updates,
+      type: 'content'
+    })
+  }
+}
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    service: 'Telegram Library Bot',
+    eventsCount: eventsCache.length,
+    clients: clients.size,
+    lastSync: lastSyncTime,
+    uptime: process.uptime()
+  })
+})
+
+// Debug endpoint
+app.get('/api/debug', (req, res) => {
+  res.json({
+    eventsCache: eventsCache.length,
+    clients: clients.size,
+    lastSync: new Date(lastSyncTime).toISOString(),
+    cacheAge: Date.now() - lastSyncTime,
+    sampleEvents: eventsCache.slice(0, 3)
+  })
+})
+
+// ===== STARTUP =====
+server.listen(PORT, async () => {
+  console.log(`🚀 Telegram Library Bot running on port ${PORT}`)
+  console.log(`📖 Group ID: ${GROUP_ID}`)
+  console.log(`🤖 Bot Token: ${BOT2_TOKEN.substring(0, 10)}...`)
+  
+  try {
+    // Initial sync on startup
+    await syncEventsFromTelegram()
+    
+    console.log(`✅ Ready: Library service with ${eventsCache.length} events`)
+    
+    // Set up periodic sync (every 5 minutes)
+    setInterval(async () => {
+      try {
+        const oldCount = eventsCache.length
+        await syncEventsFromTelegram()
+        
+        if (eventsCache.length !== oldCount) {
+          console.log(`🔄 Auto-sync: ${oldCount} → ${eventsCache.length} events`)
+          broadcast('EVENTS_SYNCED', { 
+            count: eventsCache.length,
+            timestamp: Date.now() 
+          })
+        }
+      } catch (error) {
+        console.error('Auto-sync error:', error)
+      }
+    }, 5 * 60 * 1000) // 5 minutes
+    
+  } catch (error) {
+    console.error('❌ Startup error:', error)
+  }
 })
