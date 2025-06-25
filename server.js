@@ -1,33 +1,37 @@
 #!/usr/bin/env node
 /**
- * Feed Server - Только чтение ленты
- * ==================================
+ * Stateless Feed Server - Telegram Group as Database
+ * =================================================
  * 
- * Отдельный сервер для чтения истории группы
- * БЕЗ webhook - использует getUpdates
+ * Каждый запрос:
+ * 1. Читает ВСЮ группу
+ * 2. Парсит в события  
+ * 3. Отдает пользователю
+ * 4. Забывает все
  */
 
 const express = require('express')
 const TelegramBot = require('node-telegram-bot-api')
 const cors = require('cors')
 
-class FeedServer {
+class StatelessFeedServer {
   constructor() {
-    // Используем ДРУГОЙ бот-токен!
+    // Другой бот без webhook
     this.BOT_TOKEN = process.env.FEED_BOT_TOKEN || "7948285859:AAEEQMIUqgiFaWKYpm5CPMHg1zJvL3q4mKM"
     this.PUBLICATION_GROUP = process.env.PUBLICATION_GROUP || "-1002361596586"
-    this.PORT = process.env.PORT || 3001 // Другой порт
+    this.PORT = process.env.PORT || 3001
 
     this.app = express()
-    this.bot = new TelegramBot(this.BOT_TOKEN, { polling: false }) // БЕЗ webhook и polling
+    this.bot = new TelegramBot(this.BOT_TOKEN, { polling: false })
 
     this.initialize()
   }
 
   async initialize() {
-    console.log('🍽️ Initializing Feed Server...')
+    console.log('🗄️ Initializing Stateless Feed Server...')
     console.log(`📱 Feed Bot Token: ${this.BOT_TOKEN.substring(0, 10)}...`)
     console.log(`📢 Publication Group: ${this.PUBLICATION_GROUP}`)
+    console.log(`💾 Mode: Telegram Group as Database (no cache)`)
 
     this.setupMiddleware()
     this.setupRoutes()
@@ -39,14 +43,15 @@ class FeedServer {
     this.app.use(express.json())
 
     this.app.use((req, res, next) => {
-      console.log(`🍽️ ${req.method} ${req.path}`)
+      console.log(`🗄️ ${req.method} ${req.path}`)
       next()
     })
 
     this.app.get('/health', (req, res) => {
       res.json({
         status: 'healthy',
-        server: 'feed-server',
+        server: 'stateless-feed-server',
+        mode: 'telegram-group-as-database',
         uptime: process.uptime(),
         timestamp: new Date().toISOString()
       })
@@ -54,21 +59,24 @@ class FeedServer {
   }
 
   setupRoutes() {
-    // ГЛАВНЫЙ ENDPOINT - чтение ленты
+    // ЕДИНСТВЕННЫЙ ENDPOINT
     this.app.get('/api/feed', async (req, res) => {
       try {
-        console.log('📖 Reading Telegram group history...')
+        console.log('🗄️ Reading ENTIRE Telegram group as database...')
 
-        // Читаем через getUpdates (работает без webhook)
-        const messages = await this.getGroupMessages()
+        // Читаем ВСЮ группу заново каждый раз
+        const allMessages = await this.readEntireGroupAsDatabase()
+        
+        // Парсим в события
         const events = []
-
-        for (const message of messages) {
+        for (const message of allMessages) {
           const event = this.parsePublicationMessage(message)
           if (event) events.push(event)
         }
 
-        // Фильтрация
+        console.log(`📊 Parsed ${events.length} events from ${allMessages.length} messages`)
+
+        // Фильтрация и пагинация
         const { search, city, category, page = 1, limit = 20 } = req.query
         let filteredEvents = events
 
@@ -83,7 +91,7 @@ class FeedServer {
         if (city) filteredEvents = filteredEvents.filter(e => e.city === city)
         if (category) filteredEvents = filteredEvents.filter(e => e.category === category)
 
-        // Сортировка по дате
+        // Сортировка по дате (новые первые)
         filteredEvents.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
 
         // Пагинация
@@ -94,45 +102,49 @@ class FeedServer {
           posts: paginatedEvents,
           hasMore: paginatedEvents.length === parseInt(limit),
           total: filteredEvents.length,
-          server: 'feed-server'
+          server: 'stateless-database-mode'
         })
 
-        console.log(`📋 Sent ${paginatedEvents.length} events from ${events.length} total`)
+        console.log(`📋 Sent ${paginatedEvents.length} events. Server forgot everything.`)
+        
+        // Сервер забывает все - никакого кеша!
+
       } catch (error) {
-        console.error('❌ Feed error:', error)
-        res.status(500).json({ error: 'Failed to fetch events' })
+        console.error('❌ Database read error:', error)
+        res.status(500).json({ error: 'Failed to read database' })
       }
     })
   }
 
-  async getGroupMessages() {
+  async readEntireGroupAsDatabase() {
     try {
-      // Читаем через getUpdates (работает БЕЗ webhook)
+      // Читаем БЕЗ offset - получаем все доступные updates
+      // Telegram хранит updates ~24 часа
+      console.log('📖 Reading all available updates from Telegram...')
+      
       const updates = await this.bot.getUpdates({ 
-        limit: 100,
-        timeout: 5 // Короткий timeout
+        limit: 100,    // Максимум за раз
+        timeout: 10,   // Подождать новых
+        // НЕТ offset - читаем все доступные
       })
 
-      const messages = updates
+      console.log(`📨 Received ${updates.length} total updates`)
+
+      // Фильтруем сообщения из нужной группы с #event
+      const relevantMessages = updates
         .filter(update =>
           (update.message && update.message.chat.id.toString() === this.PUBLICATION_GROUP) ||
           (update.channel_post && update.channel_post.chat.id.toString() === this.PUBLICATION_GROUP)
         )
         .map(update => update.message || update.channel_post)
-        .filter(msg => msg.text && msg.text.includes('#event'))
+        .filter(msg => msg && msg.text && msg.text.includes('#event'))
 
-      console.log(`📨 Found ${messages.length} relevant messages`)
-      
-      // Очищаем updates чтобы не накапливались
-      if (updates.length > 0) {
-        const lastUpdateId = Math.max(...updates.map(u => u.update_id))
-        await this.bot.getUpdates({ offset: lastUpdateId + 1, limit: 1 })
-      }
-      
-      return messages
+      console.log(`🎯 Found ${relevantMessages.length} relevant event messages`)
+
+      return relevantMessages
 
     } catch (error) {
-      console.error('❌ Failed to get group messages:', error)
+      console.error('❌ Failed to read group database:', error)
       return []
     }
   }
@@ -147,7 +159,7 @@ class FeedServer {
 
       const lines = text.split('\n').filter(line => line.trim())
 
-      // Извлекаем данные
+      // Парсим как раньше
       const title = lines[0]?.replace(/^🎯\s*/, '').trim()
       const description = lines[1]?.trim()
 
@@ -171,7 +183,7 @@ class FeedServer {
           username: undefined,
           telegramId: undefined
         },
-        authorId: `telegram_user_${message.from?.id || 'unknown'}`,
+        authorId: `telegram_user_${message.from?.id || message.sender_chat?.id || 'unknown'}`,
         city: cityLine?.replace('📍 ', '').trim() || '',
         category: categoryLine?.replace('📂 ', '').trim() || '',
         gender: '',
@@ -193,21 +205,22 @@ class FeedServer {
 
   startServer() {
     this.app.listen(this.PORT, () => {
-      console.log(`🍽️ Feed Server running on port ${this.PORT}`)
-      console.log(`📖 Only reads group history - NO webhook conflicts`)
+      console.log(`🗄️ Stateless Feed Server running on port ${this.PORT}`)
+      console.log(`📊 Each request reads entire Telegram group as database`)
+      console.log(`🧹 Zero persistence - server forgets everything after each request`)
     })
   }
 }
 
 // Запуск
-const feedServer = new FeedServer()
+const server = new StatelessFeedServer()
 
 process.on('SIGTERM', () => {
-  console.log('🛑 Feed server shutting down')
+  console.log('🛑 Stateless server shutting down (nothing to save)')
   process.exit(0)
 })
 
 process.on('SIGINT', () => {
-  console.log('🛑 Feed server shutting down')  
+  console.log('🛑 Stateless server shutting down (nothing to save)')  
   process.exit(0)
 })
