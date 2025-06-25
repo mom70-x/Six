@@ -14,7 +14,7 @@ const cors = require('cors')
 class FeedServer {
   constructor() {
     // Используем ДРУГОЙ бот-токен!
-    this.BOT_TOKEN = process.env.FEED_BOT_TOKEN || "НОВЫЙ_ТОКЕН_ВТОРОГО_БОТА"
+    this.BOT_TOKEN = process.env.FEED_BOT_TOKEN || "7948285859:AAEEQMIUqgiFaWKYpm5CPMHg1zJvL3q4mKM"
     this.PUBLICATION_GROUP = process.env.PUBLICATION_GROUP || "-1002361596586"
     this.PORT = process.env.PORT || 3001 // Другой порт
 
